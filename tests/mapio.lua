@@ -50,6 +50,7 @@ local IO = PocketMap.MapIO
 local models = {
 	[1] = { mins = Vector(-20, -20, -8), maxs = Vector(20, 20, 80) },
 	[2] = { mins = Vector(-40, -8, 0), maxs = Vector(40, 8, 80) },
+	[3] = { mins = Vector(-2.49, -64, -62), maxs = Vector(2.51, 64, 62) },
 }
 local function world(entities)
 	local mini = { bsp = { GetBModels = function() return models end } }
@@ -66,6 +67,43 @@ local function advance(session, ticks)
 end
 
 local tests = {}
+function tests.movedir_angles()
+	local session, state = world({
+		{ classname = "func_door", targetname = "vertical", model = "*3", origin = Vector(0, 0, 0),
+			movedir = "-90 0 0", lip = 5, speed = 75, wait = -1, spawnflags = 32 },
+		{ classname = "func_door", targetname = "horizontal", model = "*2", origin = Vector(200, 0, 0),
+			movedir = "0 90 0", lip = 8, speed = 75 },
+	})
+	local vertical, horizontal = state.world.names.vertical[1], state.world.names.horizontal[1]
+	local up = IO.Direction(vertical)
+	local right = IO.Direction(horizontal)
+	assert(math.abs(up.z - 1) < 0.00001 and math.abs(up.x) < 0.00001, "movedir -90 pitch should point upward")
+	assert(math.abs(right.y - 1) < 0.00001 and math.abs(right.x) < 0.00001, "movedir 90 yaw should point along +Y")
+	assert(IO.Travel(vertical, up) == 124, "vertical door travel must use height rather than thickness")
+	IO.Input(state, vertical, "Open")
+	advance(session, 10)
+	assert(math.abs(IO.Position(state, vertical).z - 37.5) < 0.001, "vertical door failed to translate along +Z")
+	advance(session, 30)
+	assert(math.abs(IO.Position(state, vertical).z - 119) < 0.001, "vertical door failed to reach full height")
+	IO.Input(state, horizontal, "Open")
+	advance(session, 30)
+	assert(IO.Position(state, horizontal).y > 0, "horizontal door failed to follow Hammer yaw")
+	print("PASS movedir angles: pitch/yaw direction, vertical travel, door translation")
+end
+
+function tests.hot_reload()
+	local original = IO.classes.func_button
+	local steps, draws, version = #IO.steps, #IO.draws, IO.registrationVersion
+	dofile("lua/pocketmap/mapio/cl_core.lua")
+	assert(PocketMap.MapIO == IO and IO.classes.func_button == original, "core refresh cleared registered handlers")
+	assert(#IO.steps == steps and #IO.draws == draws, "core refresh changed callback counts")
+	dofile("lua/pocketmap/mapio/cl_buttons.lua")
+	dofile("lua/pocketmap/mapio/cl_doors.lua")
+	assert(#IO.steps == steps and #IO.draws == draws, "handler refresh duplicated callbacks")
+	assert(IO.registrationVersion > version, "handler refresh did not register its new revision")
+	print("PASS hot reload: handlers preserved, callbacks replaced")
+end
+
 function tests.session_reload()
 	local mini = { bsp = {
 		GetBModels = function() return models end,
@@ -198,7 +236,7 @@ end
 
 function tests.movers()
 	local session, state = world({
-		{ classname = "func_movelinear", model = "*2", targetname = "elevator", origin = Vector(0, 100, 0), movedir = "0 0 1", movedistance = 100, speed = 100,
+		{ classname = "func_movelinear", model = "*2", targetname = "elevator", origin = Vector(0, 100, 0), movedir = "-90 0 0", movedistance = 100, speed = 100,
 			OnFullyOpen = "relay,Enable,,0,-1" },
 		{ classname = "func_tracktrain", model = "*1", targetname = "train", origin = Vector(200, 0, 0), target = "A", speed = 100 },
 		{ classname = "path_track", targetname = "A", origin = Vector(250, 0, 0), target = "B", OnPass = "relay,Enable,,0,-1" },
@@ -222,7 +260,7 @@ end
 
 function tests.conveyor()
 	local session, state = world({
-		{ classname = "func_conveyor", model = "*2", targetname = "belt", origin = Vector(), movedir = "1 0 0", speed = 60,
+		{ classname = "func_conveyor", model = "*2", targetname = "belt", origin = Vector(), movedir = "0 0 0", speed = 60,
 			OnStartTouch = "relay,Enable,,0,-1" },
 		{ classname = "logic_relay", targetname = "relay", StartDisabled = 1 },
 	})

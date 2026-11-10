@@ -1,14 +1,45 @@
 -- Hammer inputs and outputs for the virtual map. Everything lives on the miniature;
 -- nothing is sent to the server or dispatched to entities in the actual map.
-PocketMap.MapIO = {}
+PocketMap.MapIO = PocketMap.MapIO or {}
 local IO = PocketMap.MapIO
 local Entities = PocketMap.Entities
 
-IO.classes = {}
-IO.steps = {}
-IO.dynamic = {}
-IO.draws = {}
-IO.registrationVersion = 0
+IO.classes = IO.classes or {}
+IO.steps = IO.steps or {}
+IO.dynamic = IO.dynamic or {}
+IO.draws = IO.draws or {}
+IO.registrationVersion = IO.registrationVersion or 0
+
+-- Auto-refresh reloads individual files. Keep existing handlers and replace
+-- each file's step/draw callback instead of accumulating duplicate hooks.
+local function callbackSources(callbacks)
+	local unique, sources = {}, {}
+	for _, callback in ipairs(callbacks) do
+		local source = debug.getinfo(callback, "S").source
+		local index = sources[source]
+		if index then
+			unique[index] = callback
+		else
+			unique[#unique + 1] = callback
+			sources[source] = #unique
+		end
+	end
+	return unique, sources
+end
+
+IO.steps, IO.stepSources = callbackSources(IO.steps)
+IO.draws, IO.drawSources = callbackSources(IO.draws)
+
+local function registerCallback(callbacks, sources, callback)
+	local source = debug.getinfo(callback, "S").source
+	local index = sources[source]
+	if index then
+		callbacks[index] = callback
+	else
+		callbacks[#callbacks + 1] = callback
+		sources[source] = #callbacks
+	end
+end
 
 function IO.DynamicClass(class)
 	IO.dynamic[class] = true
@@ -48,17 +79,21 @@ function IO.Register(class, handlers)
 end
 
 function IO.OnStep(callback)
-	IO.steps[#IO.steps + 1] = callback
+	registerCallback(IO.steps, IO.stepSources, callback)
 end
 
 function IO.OnDraw(callback)
-	IO.draws[#IO.draws + 1] = callback
+	registerCallback(IO.draws, IO.drawSources, callback)
 end
 
 -- Hammer brush movers use a direction and travel distance, not world coordinates.
 function IO.Direction(record)
-	local value = IO.Vector(IO.Value(record.entity, "movedir"))
-	if value and value:Length() > 0 then return value:GetNormalized() end
+	-- Hammer stores movedir as pitch/yaw/roll. Pitch -90 points upward;
+	-- treating those three values as a vector makes vertical doors immobile.
+	local value = IO.Value(record.entity, "movedir")
+	if isangle(value) then return value:Forward() end
+	local angles = IO.Vector(value)
+	if angles then return Angle(angles.x, angles.y, angles.z):Forward() end
 	local angle = tonumber(IO.Value(record.entity, "angle"))
 	if angle == -1 then return Vector(0, 0, 1) end
 	if angle == -2 then return Vector(0, 0, -1) end
