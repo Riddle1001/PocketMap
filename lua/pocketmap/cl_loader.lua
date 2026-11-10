@@ -31,8 +31,8 @@ local FACES_PER_YIELD = 10
 -- Keep the 3D skybox's smaller batches for its existing draw path.
 local WORLD_SLICES_PER_MESH = 4
 local WORLD_CELL_SIZE = 1024
-local WORLD_MIN_SPATIAL_FACES = 96
 local WORLD_MIN_CELL_FACES = 24
+local WORLD_SPARSE_CELL_SIZE = 4096
 local WORLD_PVS_MAX_SPAN = 1536
 local WORLD_PVS_MAX_LEAFS = 128
 local WORLD_PVS_PAD = 8
@@ -173,10 +173,10 @@ end
 -- The face corners are only used to choose a cell; the bounds used to cull are
 -- calculated from the actual rendered triangles in buildSlice below.
 local function worldSpatialLists( list, material )
-	if #list < WORLD_MIN_SPATIAL_FACES or not material
+	if #list < 2 or not material
 		or NikNaks.MeshBuilder.BlendsWithBackground( material ) then return { list } end
 
-	local cells, order = {}, {}
+	local cells, order, sparseKeys = {}, {}, {}
 	for i = 1, #list do
 		local face = list[i]
 		local corners = face:GetVertexs()
@@ -190,7 +190,9 @@ local function worldSpatialLists( list, material )
 		local key = math.floor( x / size ) .. ":" .. math.floor( y / size ) .. ":" .. math.floor( z / size )
 		local cell = cells[key]
 		if not cell then
+			local sparseSize = #corners * WORLD_SPARSE_CELL_SIZE
 			cell = {}
+			sparseKeys[cell] = math.floor( x / sparseSize ) .. ":" .. math.floor( y / sparseSize ) .. ":" .. math.floor( z / sparseSize )
 			cells[key] = cell
 			order[#order + 1] = cell
 		end
@@ -200,16 +202,25 @@ local function worldSpatialLists( list, material )
 	end
 
 	if #order < 2 then return { list } end
-	local batches, sparse = {}, {}
+	local batches, sparse, sparseOrder = {}, {}, {}
 	for i = 1, #order do
 		local cell = order[i]
 		if #cell >= WORLD_MIN_CELL_FACES then
 			batches[#batches + 1] = cell
 		else
-			table.Add( sparse, cell )
+			-- Sparse cells must not be merged across the whole map: a single
+			-- mesh mixing streets and isolated rooftop rooms defeats BSP PVS.
+			local key = sparseKeys[cell]
+			local group = sparse[key]
+			if not group then
+				group = {}
+				sparse[key] = group
+				sparseOrder[#sparseOrder + 1] = group
+			end
+			table.Add( group, cell )
 		end
 	end
-	if #sparse > 0 then batches[#batches + 1] = sparse end
+	for i = 1, #sparseOrder do batches[#batches + 1] = sparseOrder[i] end
 	return #batches > 1 and batches or { list }
 end
 
