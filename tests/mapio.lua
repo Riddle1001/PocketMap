@@ -246,6 +246,39 @@ function tests.conveyor()
 	print("PASS conveyor: surface contact, speed, outputs, stop, restart, leave")
 end
 
+function tests.spatial_trace()
+	local session, state = world({
+		{ classname = "func_door", model = "*2", targetname = "moving", origin = Vector() },
+		{ classname = "func_door", model = "*1", targetname = "far", origin = Vector(3000, 3000, 0) },
+	})
+	local door = state.world.names.moving[1]
+	local mins, maxs = Vector(-16, -16, 0), Vector(16, 16, 72)
+	local function trace(x1, x2)
+		local result = { Fraction = 1 }
+		IO.Trace(session, Vector(x1, 0, 40), Vector(x2, 0, 40), mins, maxs, result)
+		return result
+	end
+	local function traceY(y1, y2, x)
+		local result = { Fraction = 1 }
+		IO.Trace(session, Vector(x or 0, y1, 40), Vector(x or 0, y2, 40), mins, maxs, result)
+		return result
+	end
+
+	session.command = 1
+	assert(trace(-100, 100).Entity == door, "original brush was missing from the spatial index")
+	assert(trace(500, 600).Fraction == 1, "distant brush caused a false collision")
+
+	IO.State(state, door).origin = Vector(1024, 0, 0)
+	session.command = 2
+	assert(trace(-100, 100).Fraction == 1, "moved brush remained in its previous cells")
+	assert(trace(900, 1100).Entity == door, "moved brush was missing from its new cells")
+
+	IO.State(state, door).angles = Angle(0, 90, 0)
+	session.command = 3
+	assert(traceY(-70, -30, 1024).Entity == door, "rotated brush was missing from the spatial index")
+	print("PASS spatial trace: nearby collision, distant rejection, moved and rotated brushes")
+end
+
 for name, test in pairs(tests) do
 	if not arg[1] or arg[1] == name then test() end
 end

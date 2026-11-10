@@ -222,44 +222,152 @@ function IO.Overlaps(session, record, mins, maxs)
 		and pos.z + maxs.z >= lo.z and pos.z + mins.z <= hi.z
 end
 
+-- Index brush bounds once per walking session, then refresh moved brushes as
+-- commands advance. Every ground, wall and stair probe shares this index.
+local TRACE_CELL_SIZE = 256
+local TRACE_AXES = { "x", "y", "z" }
+
+local function traceCells(lo, hi)
+	return math.floor(lo.x / TRACE_CELL_SIZE), math.floor(hi.x / TRACE_CELL_SIZE),
+		math.floor(lo.y / TRACE_CELL_SIZE), math.floor(hi.y / TRACE_CELL_SIZE)
+end
+
+local function removeTraceEntry(grid, entry)
+	for x = entry.x1, entry.x2 do
+		local column = grid.cells[x]
+		for y = entry.y1, entry.y2 do
+			local cell = column[y]
+			for i = #cell, 1, -1 do
+				if cell[i] == entry then table.remove(cell, i) break end
+			end
+			if #cell == 0 then column[y] = nil end
+		end
+		if not next(column) then grid.cells[x] = nil end
+	end
+end
+
+local function setTraceBounds(grid, entry, lo, hi)
+	local x1, x2, y1, y2 = traceCells(lo, hi)
+	if entry.x1 and (entry.x1 ~= x1 or entry.x2 ~= x2 or entry.y1 ~= y1 or entry.y2 ~= y2) then
+		removeTraceEntry(grid, entry)
+	end
+	if entry.x1 ~= x1 or entry.x2 ~= x2 or entry.y1 ~= y1 or entry.y2 ~= y2 then
+		for x = x1, x2 do
+			local column = grid.cells[x]
+			if not column then column = {} grid.cells[x] = column end
+			for y = y1, y2 do
+				local cell = column[y]
+				if not cell then cell = {} column[y] = cell end
+				cell[#cell + 1] = entry
+			end
+		end
+	end
+	entry.x1, entry.x2, entry.y1, entry.y2 = x1, x2, y1, y2
+	entry.lo, entry.hi = lo, hi
+end
+
+local function rememberTracePose(entry, origin, angles)
+	entry.px, entry.py, entry.pz = origin.x, origin.y, origin.z
+	entry.pitch, entry.yaw, entry.roll = angles.p, angles.y, angles.r
+end
+
+local function traceGrid(session, state)
+	local grid = session.mapIOTraceGrid
+	if not grid or grid.world ~= state.world then
+		grid = { world = state.world, cells = {}, entries = {} }
+		for _, record in ipairs(state.world.solids) do
+			local handler = IO.classes[record.class]
+			if handler and handler.solid and (handler.solid == true or handler.solid(state, record)) then
+				local current = state.records[record]
+				local origin = current and current.origin or record.origin
+				local angles = current and current.angles or record.angles
+				local entry = { record = record }
+				rememberTracePose(entry, origin, angles)
+				local lo, hi = IO.Bounds(record, state)
+				if lo then
+					setTraceBounds(grid, entry, lo, hi)
+					grid.entries[#grid.entries + 1] = entry
+				end
+			end
+		end
+		session.mapIOTraceGrid = grid
+	end
+	if grid.command ~= session.command then
+		grid.command = session.command
+		for _, entry in ipairs(grid.entries) do
+			local record = entry.record
+			local current = state.records[record]
+			local origin = current and current.origin or record.origin
+			local angles = current and current.angles or record.angles
+			if origin.x ~= entry.px or origin.y ~= entry.py or origin.z ~= entry.pz
+				or angles.p ~= entry.pitch or angles.y ~= entry.yaw or angles.r ~= entry.roll then
+				rememberTracePose(entry, origin, angles)
+				local lo, hi = IO.Bounds(record, state)
+				if lo then setTraceBounds(grid, entry, lo, hi) end
+			end
+		end
+	end
+	return grid
+end
+
+local function traceSolid(record, lo, hi, start, finish, mins, maxs, out)
+	local low = lo - maxs
+	local high = hi - mins
+	local enter, leave, normal = 0, 1, nil
+	local inside, rejected = true, false
+	for _, axis in ipairs(TRACE_AXES) do
+		local a, b = start[axis], finish[axis]
+		if a < low[axis] or a > high[axis] then inside = false end
+		if math.abs(b - a) < 0.000001 then
+			if a < low[axis] or a > high[axis] then rejected = true break end
+		else
+			local t1, t2 = (low[axis] - a) / (b - a), (high[axis] - a) / (b - a)
+			local sign = -1
+			if t1 > t2 then t1, t2, sign = t2, t1, 1 end
+			if t1 > enter then
+				enter = t1
+				normal = Vector(axis == "x" and sign or 0, axis == "y" and sign or 0, axis == "z" and sign or 0)
+			end
+			leave = math.min(leave, t2)
+		end
+	end
+	if rejected then return end
+	if inside then
+		out.StartSolid = true
+		if finish.x >= low.x and finish.x <= high.x and finish.y >= low.y and finish.y <= high.y and finish.z >= low.z and finish.z <= high.z then
+			out.AllSolid, out.Fraction, out.Entity = true, 0, record
+		end
+	elseif enter <= leave and enter < out.Fraction and normal then
+		out.Fraction, out.HitNormal, out.Entity = math.max(0, enter - 0.0001), normal, record
+		out.Contents = CONTENTS_SOLID or 1
+	end
+end
+
 -- The same local BSP coordinates as Session:TraceHull, without spawning actual entities.
 function IO.Trace(session, start, finish, mins, maxs, out)
 	local state = session.io
 	if not state or not state.world or not state.world.solids then return end
-	for _, record in ipairs(state.world.solids) do
-		local handler = IO.classes[record.class]
-		if handler and handler.solid and (handler.solid == true or handler.solid(state, record)) then
-			local lo, hi = IO.Bounds(record, state)
-			if lo then
-				local low = lo - maxs
-				local high = hi - mins
-				local enter, leave, normal = 0, 1, nil
-				local inside, rejected = true, false
-				for _, axis in ipairs({ "x", "y", "z" }) do
-					local a, b = start[axis], finish[axis]
-					if a < low[axis] or a > high[axis] then inside = false end
-					if math.abs(b - a) < 0.000001 then
-						if a < low[axis] or a > high[axis] then rejected = true break end
-					else
-						local t1, t2 = (low[axis] - a) / (b - a), (high[axis] - a) / (b - a)
-						local sign = -1
-						if t1 > t2 then t1, t2, sign = t2, t1, 1 end
-						if t1 > enter then
-							enter = t1
-							normal = Vector(axis == "x" and sign or 0, axis == "y" and sign or 0, axis == "z" and sign or 0)
+	local grid = traceGrid(session, state)
+	local x1 = math.floor((math.min(start.x, finish.x) + mins.x) / TRACE_CELL_SIZE)
+	local x2 = math.floor((math.max(start.x, finish.x) + maxs.x) / TRACE_CELL_SIZE)
+	local y1 = math.floor((math.min(start.y, finish.y) + mins.y) / TRACE_CELL_SIZE)
+	local y2 = math.floor((math.max(start.y, finish.y) + maxs.y) / TRACE_CELL_SIZE)
+	local z1 = math.min(start.z, finish.z) + mins.z
+	local z2 = math.max(start.z, finish.z) + maxs.z
+	local seen = {}
+	for x = x1, x2 do
+		local column = grid.cells[x]
+		if column then
+			for y = y1, y2 do
+				local cell = column[y]
+				if cell then
+					for _, entry in ipairs(cell) do
+						if not seen[entry] then
+							seen[entry] = true
+							if entry.lo.z <= z2 and entry.hi.z >= z1 then
+								traceSolid(entry.record, entry.lo, entry.hi, start, finish, mins, maxs, out)
+							end
 						end
-						leave = math.min(leave, t2)
-					end
-				end
-				if not rejected then
-					if inside then
-						out.StartSolid = true
-						if finish.x >= low.x and finish.x <= high.x and finish.y >= low.y and finish.y <= high.y and finish.z >= low.z and finish.z <= high.z then
-							out.AllSolid, out.Fraction, out.Entity = true, 0, record
-						end
-					elseif enter <= leave and enter < out.Fraction and normal then
-						out.Fraction, out.HitNormal, out.Entity = math.max(0, enter - 0.0001), normal, record
-						out.Contents = CONTENTS_SOLID or 1
 					end
 				end
 			end
@@ -323,7 +431,7 @@ function IO.Draw(mini, options, translucent)
 		matrix:Set(mini.matrix)
 		matrix:Translate(IO.Position(state, item.record))
 		matrix:Rotate(IO.Rotation(state, item.record))
-		matrix:Multiply(item.inverse)
+		matrix:Mul(item.inverse)
 		if translucent then item.mesh:DrawTranslucent(matrix, options) else item.mesh:DrawOpaque(matrix, options) end
 	end
 	for _, callback in ipairs(IO.draws) do callback(mini, state, translucent) end
