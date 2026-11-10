@@ -267,6 +267,61 @@ local function worldClusters( bsp, mins, maxs )
 	return #clusters > 0 and clusters or nil
 end
 
+-- The BSP leaf-face table identifies which visibility clusters actually touch
+-- each world face. Mesh bounds can cross unrelated rooms (or the void between
+-- them), so their AABB alone is a poor way to identify the face's clusters.
+-- An unlinked face remains unknown and uses the conservative AABB fallback.
+local function worldFaceClusters( bsp )
+	local faceClusters = {}
+	local leafFaces = bsp:GetLeafFaces()
+	local processed = 0
+	for _, leaf in pairs( bsp:GetLeafs() ) do
+		local cluster = leaf.cluster
+		for index = leaf.firstleafface + 1, leaf.firstleafface + leaf.numleaffaces do
+			local faceId = leafFaces[index]
+			if faceId then
+				local clusters = faceClusters[faceId]
+				if cluster < 0 and bit.band( leaf.contents or 0, CONTENTS_SOLID ) == 0 then
+					faceClusters[faceId] = false
+				elseif cluster >= 0 and clusters ~= false then
+					if not clusters then
+						faceClusters[faceId] = { cluster }
+					else
+						local found = false
+						for i = 1, #clusters do
+							if clusters[i] == cluster then found = true break end
+						end
+						if not found then clusters[#clusters + 1] = cluster end
+					end
+				end
+			end
+		end
+		processed = processed + 1
+		if processed % 256 == 0 then coroutine.yield() end
+	end
+	return faceClusters
+end
+
+-- Keep all clusters touched by the faces in this mesh. If even one face has
+-- uncertain membership, reject by PVS only when its whole AABB is provably
+-- in known leaves, preserving faces that cannot be mapped safely.
+local function sliceClusters( job, list, first, last, mins, maxs )
+	local clusters, seen = {}, {}
+	for i = first, last do
+		local face = list[i]
+		local linked = face:IsWorld() and job.faceClusters[face.__id]
+		if not linked or #linked == 0 then return worldClusters( job.bsp, mins, maxs ) end
+		for j = 1, #linked do
+			local cluster = linked[j]
+			if not seen[cluster] then
+				seen[cluster] = true
+				clusters[#clusters + 1] = cluster
+			end
+		end
+	end
+	return #clusters > 0 and clusters or nil
+end
+
 ---@param out table # collects the MeshObjects
 local function buildMaterialGroups( mini, job, groups, order, out, isWorld, progress )
 	for _, key in ipairs( order ) do
@@ -299,7 +354,7 @@ local function buildMaterialGroups( mini, job, groups, order, out, isWorld, prog
 					if mins and maxs then
 						center = ( mins + maxs ) * 0.5
 						radius = ( maxs - mins ):Length() * 0.5 + 8
-						clusters = worldClusters( job.bsp, mins, maxs )
+						clusters = sliceClusters( job, batch, first, last, mins, maxs )
 						-- The mini's fit never changes after loading, so transform
 						-- the bounds once instead of for every draw call.
 						blockCenter = ( center - mini.mapCenter ) * mini.scale + mini.boxCenter
@@ -328,10 +383,12 @@ local function buildWorldMeshes( mini, job )
 	local progress = { done = 0 }
 	mini.objects.opaqueMeshes = {}
 	mini.objects.translucentMeshes = {}
+	job.faceClusters = worldFaceClusters( job.bsp )
 
 	buildMaterialGroups( mini, job, job.groups, job.order, mini.objects, true, progress )
 	if mini.lightmapTexture then buildMaterialGroups( mini, job, job.skyGroups, job.skyOrder, mini.skyObjects, false, progress ) end
 
+	job.faceClusters = nil
 	job.addOptions = nil
 	coroutine.yield()
 end
