@@ -349,34 +349,37 @@ local function traceGrid(session, state)
 end
 
 local function traceSolid(record, lo, hi, start, finish, mins, maxs, out)
-	local low = lo - maxs
-	local high = hi - mins
-	local enter, leave, normal = 0, 1, nil
-	local inside, rejected = true, false
+	local enter, leave, normalAxis, normalSign = 0, 1, nil, nil
+	local inside = true
 	for _, axis in ipairs(TRACE_AXES) do
+		local low, high = lo[axis] - maxs[axis], hi[axis] - mins[axis]
 		local a, b = start[axis], finish[axis]
-		if a < low[axis] or a > high[axis] then inside = false end
+		if a < low or a > high then inside = false end
 		if math.abs(b - a) < 0.000001 then
-			if a < low[axis] or a > high[axis] then rejected = true break end
+			if a < low or a > high then return end
 		else
-			local t1, t2 = (low[axis] - a) / (b - a), (high[axis] - a) / (b - a)
+			local t1, t2 = (low - a) / (b - a), (high - a) / (b - a)
 			local sign = -1
 			if t1 > t2 then t1, t2, sign = t2, t1, 1 end
 			if t1 > enter then
 				enter = t1
-				normal = Vector(axis == "x" and sign or 0, axis == "y" and sign or 0, axis == "z" and sign or 0)
+				normalAxis, normalSign = axis, sign
 			end
 			leave = math.min(leave, t2)
 		end
 	end
-	if rejected then return end
 	if inside then
 		out.StartSolid = true
-		if finish.x >= low.x and finish.x <= high.x and finish.y >= low.y and finish.y <= high.y and finish.z >= low.z and finish.z <= high.z then
+		if finish.x >= lo.x - maxs.x and finish.x <= hi.x - mins.x
+			and finish.y >= lo.y - maxs.y and finish.y <= hi.y - mins.y
+			and finish.z >= lo.z - maxs.z and finish.z <= hi.z - mins.z then
 			out.AllSolid, out.Fraction, out.Entity = true, 0, record
 		end
-	elseif enter <= leave and enter < out.Fraction and normal then
-		out.Fraction, out.HitNormal, out.Entity = math.max(0, enter - 0.0001), normal, record
+	elseif enter <= leave and enter < out.Fraction and normalAxis then
+		out.Fraction = math.max(0, enter - 0.0001)
+		out.HitNormal = Vector(normalAxis == "x" and normalSign or 0,
+			normalAxis == "y" and normalSign or 0, normalAxis == "z" and normalSign or 0)
+		out.Entity = record
 		out.Contents = CONTENTS_SOLID or 1
 	end
 end
@@ -386,13 +389,16 @@ function IO.Trace(session, start, finish, mins, maxs, out)
 	local state = session.io
 	if not state or not state.world or not state.world.solids then return end
 	local grid = traceGrid(session, state)
-	local x1 = math.floor((math.min(start.x, finish.x) + mins.x) / TRACE_CELL_SIZE)
-	local x2 = math.floor((math.max(start.x, finish.x) + maxs.x) / TRACE_CELL_SIZE)
-	local y1 = math.floor((math.min(start.y, finish.y) + mins.y) / TRACE_CELL_SIZE)
-	local y2 = math.floor((math.max(start.y, finish.y) + maxs.y) / TRACE_CELL_SIZE)
+	local loX, hiX = math.min(start.x, finish.x) + mins.x, math.max(start.x, finish.x) + maxs.x
+	local loY, hiY = math.min(start.y, finish.y) + mins.y, math.max(start.y, finish.y) + maxs.y
+	local x1, x2 = math.floor(loX / TRACE_CELL_SIZE), math.floor(hiX / TRACE_CELL_SIZE)
+	local y1, y2 = math.floor(loY / TRACE_CELL_SIZE), math.floor(hiY / TRACE_CELL_SIZE)
 	local z1 = math.min(start.z, finish.z) + mins.z
 	local z2 = math.max(start.z, finish.z) + maxs.z
-	local seen = {}
+	-- One monotonically increasing query marker avoids allocating a seen table
+	-- for every ground/step/wall probe spanning multiple hash cells.
+	local query = (grid.query or 0) + 1
+	grid.query = query
 	for x = x1, x2 do
 		local column = grid.cells[x]
 		if column then
@@ -400,9 +406,11 @@ function IO.Trace(session, start, finish, mins, maxs, out)
 				local cell = column[y]
 				if cell then
 					for _, entry in ipairs(cell) do
-						if not seen[entry] then
-							seen[entry] = true
-							if entry.lo.z <= z2 and entry.hi.z >= z1 then
+						if entry.query ~= query then
+							entry.query = query
+							if entry.lo.x <= hiX and entry.hi.x >= loX
+								and entry.lo.y <= hiY and entry.hi.y >= loY
+								and entry.lo.z <= z2 and entry.hi.z >= z1 then
 								traceSolid(entry.record, entry.lo, entry.hi, start, finish, mins, maxs, out)
 							end
 						end
@@ -635,10 +643,11 @@ local function brushVisible(mini, item, view, pvs, poseChanged, stamp)
 			item.worldCenter = mini.matrix * item.mapCenter
 			item.worldStamp = stamp
 		end
-		local delta = item.worldCenter - view.origin
+		local center, origin = item.worldCenter, view.origin
+		local dx, dy, dz = center.x - origin.x, center.y - origin.y, center.z - origin.z
 		local radius = item.radius * mini.scale
 		for _, normal in ipairs(view.mapIOFrustum) do
-			if delta:Dot(normal) < -radius then visible = false break end
+			if dx * normal.x + dy * normal.y + dz * normal.z < -radius then visible = false break end
 		end
 	end
 	item.visibleView, item.visibleStamp, item.visiblePose, item.visiblePVS, item.visibleResult = view, stamp, item.pose, pvs, visible
@@ -650,14 +659,19 @@ end
 -- passes. Always prepare afresh for mirrors, water and unknown cameras.
 local function visibleMeshes(mini, state, view, pvs, stamp, opaque, transparent)
 	opaque, transparent = opaque or {}, transparent or {}
+	local records = state and state.records
 	-- Reuse the prior main-view lists, retaining their capacity across frames.
 	-- Unknown cameras get independent temporary lists.
 	for i = #opaque, 1, -1 do opaque[i] = nil end
 	for i = #transparent, 1, -1 do transparent[i] = nil end
 	for _, item in ipairs(mini.dynamicMeshes or {}) do
 		if item.opaque or item.translucent then
-			local origin = IO.Position(state, item.record)
-			local angles = IO.Rotation(state, item.record)
+			-- Render reads don't need to initialize session state. A single
+			-- records lookup replaces two IO.State calls per brush per frame.
+			local record = item.record
+			local current = records and records[record]
+			local origin = current and current.origin or record.origin
+			local angles = current and current.angles or record.angles
 			local poseChanged = item.x ~= origin.x or item.y ~= origin.y or item.z ~= origin.z
 				or item.pitch ~= angles.p or item.yaw ~= angles.y or item.roll ~= angles.r
 			if poseChanged then

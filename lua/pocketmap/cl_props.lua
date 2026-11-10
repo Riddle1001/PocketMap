@@ -489,6 +489,7 @@ local function viewFrustum( mini )
 	local angles = mini.ent:WorldToLocalAngles( view.angles )
 	return {
 		origin = mini.ent:WorldToLocal( view.origin ),
+		angles = angles,
 		forward = angles:Forward(), right = angles:Right(), up = angles:Up(),
 		halfWidth = halfWidth, halfHeight = halfHeight,
 		widthRadius = math.sqrt( 1 + halfWidth * halfWidth ),
@@ -496,18 +497,33 @@ local function viewFrustum( mini )
 	}
 end
 
+-- An opaque and translucent pass can share their visible props only when the
+-- camera, PVS and block transform are unchanged. Nested/unknown views fail open.
+local function sameCullView( context, stamp, pvs, frustum )
+	if not context or not frustum or context.frame ~= FrameNumber()
+		or context.stamp ~= stamp or context.pvs ~= pvs then return false end
+	local old = context.frustum
+	local a, b = old.origin, frustum.origin
+	local oldAngles, newAngles = old.angles, frustum.angles
+	return a.x == b.x and a.y == b.y and a.z == b.z
+		and oldAngles.p == newAngles.p and oldAngles.y == newAngles.y and oldAngles.r == newAngles.r
+		and old.halfWidth == frustum.halfWidth and old.halfHeight == frustum.halfHeight
+end
+
 local function visibleInFrustum( prop, frustum )
 	if not frustum or not prop.lcenter or not prop.sphereRadius then return true end
-	local delta = prop.lcenter - frustum.origin
-	local depth = delta:Dot( frustum.forward )
+	local center, origin = prop.lcenter, frustum.origin
+	local dx, dy, dz = center.x - origin.x, center.y - origin.y, center.z - origin.z
+	local forward, right, up = frustum.forward, frustum.right, frustum.up
+	local depth = dx * forward.x + dy * forward.y + dz * forward.z
 	local radius = prop.sphereRadius
 	if depth + radius < 0 then return false end
-	if math.abs( delta:Dot( frustum.right ) ) > depth * frustum.halfWidth + radius * frustum.widthRadius then return false end
-	if math.abs( delta:Dot( frustum.up ) ) > depth * frustum.halfHeight + radius * frustum.heightRadius then return false end
+	if math.abs( dx * right.x + dy * right.y + dz * right.z ) > depth * frustum.halfWidth + radius * frustum.widthRadius then return false end
+	if math.abs( dx * up.x + dy * up.y + dz * up.z ) > depth * frustum.halfHeight + radius * frustum.heightRadius then return false end
 	return true
 end
 
-local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum )
+local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse )
 	local parts = group.meshes
 	if parts and not hasHalf( parts, translucent ) then return 0 end
 	if not parts and translucent and group.entTranslucent == false then return 0 end
@@ -518,10 +534,20 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 	local matrix, scaleVec = mini.propMatrix, mini.propScaleVec
 	local props = group.props
 	local drawn = 0
+	local cached = reuse and group.visibilityContext == context
+	local candidates = cached and group.visibleProps or props
+	local count = cached and group.visibleCount or #props
+	local record = not translucent and context ~= nil
+	local visible = record and ( group.visibleProps or {} )
+	local visibleCount = 0
 
-	for i = 1, #props do
-		local p = props[i]
-		if visibleInPVS( p, pvs ) and visibleInFrustum( p, frustum ) then
+	for i = 1, count do
+		local p = candidates[i]
+		if cached or ( visibleInPVS( p, pvs ) and visibleInFrustum( p, frustum ) ) then
+			if record then
+				visibleCount = visibleCount + 1
+				visible[visibleCount] = p
+			end
 			-- Skip expensive model and material setup when the entire group is culled.
 			if not prepared then
 				flags = prepareEntityGroup( entity, group, translucent )
@@ -551,6 +577,9 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 				drawEntityProp( entity, state, group, p.lscale, p.skin, p.wpos, p.wang, flags )
 			end
 		end
+	end
+	if record then
+		group.visibleProps, group.visibleCount, group.visibilityContext = visible, visibleCount, context
 	end
 
 	return drawn
@@ -587,12 +616,20 @@ local function drawPass( mini, translucent )
 			end
 		end
 	end
+	local context
+	local reuse = translucent and sameCullView( mini.propCullContext, stamp, pvs, frustum )
+	if reuse then
+		context = mini.propCullContext
+	elseif not translucent then
+		context = frustum and { frame = FrameNumber(), stamp = stamp, pvs = pvs, frustum = frustum } or nil
+		mini.propCullContext = context
+	end
 
 	render.SuppressEngineLighting( true )
 	if translucent then render.OverrideDepthEnable( true, false ) end
 
 	for _, group in ipairs( mini.propGroups ) do
-		if not group.sky then drawn = drawn + drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum ) end
+		if not group.sky then drawn = drawn + drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse ) end
 	end
 
 	if translucent then render.OverrideDepthEnable( true, true ) end

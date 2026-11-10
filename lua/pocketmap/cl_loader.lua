@@ -30,6 +30,12 @@ local FACES_PER_YIELD = 10
 -- Larger world batches cut draw calls; MeshBuilder splits at its vertex limit.
 -- Keep the 3D skybox's smaller batches for its existing draw path.
 local WORLD_SLICES_PER_MESH = 4
+local WORLD_CELL_SIZE = 1024
+local WORLD_MIN_SPATIAL_FACES = 96
+local WORLD_MIN_CELL_FACES = 24
+local WORLD_PVS_MAX_SPAN = 1536
+local WORLD_PVS_MAX_LEAFS = 128
+local WORLD_PVS_PAD = 8
 local LDR_LIGHTING_LUMP, HDR_LIGHTING_LUMP, HDR_FACES_LUMP = 8, 53, 58
 local MORE = "more"
 
@@ -162,17 +168,103 @@ local function prepareLight( mini, job )
 	coroutine.yield()
 end
 
+-- Group large opaque materials by the cells their faces occupy. A giant material
+-- batch otherwise spans the map and cannot be rejected by a camera or the PVS.
+-- The face corners are only used to choose a cell; the bounds used to cull are
+-- calculated from the actual rendered triangles in buildSlice below.
+local function worldSpatialLists( list, material )
+	if #list < WORLD_MIN_SPATIAL_FACES or not material
+		or NikNaks.MeshBuilder.BlendsWithBackground( material ) then return { list } end
+
+	local cells, order = {}, {}
+	for i = 1, #list do
+		local face = list[i]
+		local corners = face:GetVertexs()
+		if not corners or #corners == 0 then return { list } end
+		local x, y, z = 0, 0, 0
+		for j = 1, #corners do
+			local p = corners[j]
+			x, y, z = x + p.x, y + p.y, z + p.z
+		end
+		local size = #corners * WORLD_CELL_SIZE
+		local key = math.floor( x / size ) .. ":" .. math.floor( y / size ) .. ":" .. math.floor( z / size )
+		local cell = cells[key]
+		if not cell then
+			cell = {}
+			cells[key] = cell
+			order[#order + 1] = cell
+		end
+		cell[#cell + 1] = face
+		face:ClearMeshData()
+		if i % FACES_PER_YIELD == 0 then coroutine.yield() end
+	end
+
+	if #order < 2 then return { list } end
+	local batches, sparse = {}, {}
+	for i = 1, #order do
+		local cell = order[i]
+		if #cell >= WORLD_MIN_CELL_FACES then
+			batches[#batches + 1] = cell
+		else
+			table.Add( sparse, cell )
+		end
+	end
+	if #sparse > 0 then batches[#batches + 1] = sparse end
+	return #batches > 1 and batches or { list }
+end
+
+-- Every MeshBuilder part from this slice is enclosed by these real triangle
+-- bounds (including displacements and transformed brush models).
 local function buildSlice( list, first, last, addOptions )
 	local builder = NikNaks.MeshBuilder()
+	local minX, minY, minZ = math.huge, math.huge, math.huge
+	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
 
 	for i = first, last do
-		builder:AddFace( list[i], addOptions )
+		local face = list[i]
+		builder:AddFace( face, addOptions )
+		local vertices = face:GenerateVertexTriangleData()
+		if vertices then
+			for j = 1, #vertices do
+				local p = vertices[j].pos
+				if p then
+					minX, minY, minZ = math.min( minX, p.x ), math.min( minY, p.y ), math.min( minZ, p.z )
+					maxX, maxY, maxZ = math.max( maxX, p.x ), math.max( maxY, p.y ), math.max( maxZ, p.z )
+				end
+			end
+		end
 		if ( i - first ) % FACES_PER_YIELD == FACES_PER_YIELD - 1 then coroutine.yield() end
 	end
 
 	local object = builder:Build()
 	for i = first, last do list[i]:ClearMeshData() end
-	return object
+	local mins, maxs
+	if minX < math.huge and maxX > -math.huge and minX == minX and maxX == maxX
+		and minY == minY and maxY == maxY and minZ == minZ and maxZ == maxZ then
+		mins, maxs = Vector( minX, minY, minZ ), Vector( maxX, maxY, maxZ )
+	end
+	return object, mins, maxs
+end
+
+-- Any uncertain leaf, too many leaves or an oversized mesh disables PVS
+-- culling for that mesh; frustum rejection can still be used independently.
+local function worldClusters( bsp, mins, maxs )
+	if not mins or not maxs or maxs.x - mins.x > WORLD_PVS_MAX_SPAN
+		or maxs.y - mins.y > WORLD_PVS_MAX_SPAN or maxs.z - mins.z > WORLD_PVS_MAX_SPAN then return nil end
+	local leaves = bsp:AABBInLeafs( 0, mins, maxs, WORLD_PVS_PAD )
+	if #leaves == 0 or #leaves > WORLD_PVS_MAX_LEAFS then return nil end
+	local clusters, seen = {}, {}
+	for i = 1, #leaves do
+		local leaf = leaves[i]
+		if not leaf or not leaf.cluster then return nil end
+		if leaf.cluster < 0 then
+			if not leaf.contents or bit.band( leaf.contents, CONTENTS_SOLID ) == 0 then return nil end
+		elseif not seen[leaf.cluster] then
+			seen[leaf.cluster] = true
+			clusters[#clusters + 1] = leaf.cluster
+		end
+	end
+	return #clusters > 0 and clusters or nil
 end
 
 ---@param out table # collects the MeshObjects
@@ -195,22 +287,38 @@ local function buildMaterialGroups( mini, job, groups, order, out, isWorld, prog
 		job.addOptions.material = material
 		local sliceSize = PocketMap.Faces.SLICE_SIZE
 		local facesPerMesh = isWorld and sliceSize * WORLD_SLICES_PER_MESH or sliceSize
-		for first = 1, #list, facesPerMesh do
-			mini:SetStatus( "Building " .. key, 0.15 + 0.45 * progress.done / job.slicesTotal )
-			local last = math.min( first + facesPerMesh - 1, #list )
-			local object = buildSlice( list, first, last, job.addOptions )
-			out[#out + 1] = object
-			if isWorld then
-				-- Keep the draw lists on the owning objects array so they go away when the miniature is destroyed.
-				for _, part in ipairs( object:GetMeshes() ) do
-					local drawList = part.translucent and out.translucentMeshes or out.opaqueMeshes
-					drawList[#drawList + 1] = part
+		local batches = isWorld and worldSpatialLists( list, material ) or { list }
+		for _, batch in ipairs( batches ) do
+			for first = 1, #batch, facesPerMesh do
+				mini:SetStatus( "Building " .. key, 0.15 + 0.45 * math.min( 1, progress.done / job.slicesTotal ) )
+				local last = math.min( first + facesPerMesh - 1, #batch )
+				local object, mins, maxs = buildSlice( batch, first, last, job.addOptions )
+				out[#out + 1] = object
+				if isWorld then
+					local center, radius, clusters, blockCenter, blockRadius
+					if mins and maxs then
+						center = ( mins + maxs ) * 0.5
+						radius = ( maxs - mins ):Length() * 0.5 + 8
+						clusters = worldClusters( job.bsp, mins, maxs )
+						-- The mini's fit never changes after loading, so transform
+						-- the bounds once instead of for every draw call.
+						blockCenter = ( center - mini.mapCenter ) * mini.scale + mini.boxCenter
+						blockRadius = radius * mini.scale
+					end
+					-- Mesh objects still own the IMesh handles; the draw list only
+					-- references those handles and their conservative bounds.
+					for _, part in ipairs( object:GetMeshes() ) do
+						part.worldCenter, part.worldRadius, part.worldClusters = center, radius, clusters
+						part.blockCenter, part.blockRadius = blockCenter, blockRadius
+						local drawList = part.translucent and out.translucentMeshes or out.opaqueMeshes
+						drawList[#drawList + 1] = part
+					end
 				end
-			end
 
-			-- Faces.Sort counts the original slices, including the smaller skybox batches.
-			progress.done = progress.done + math.ceil( ( last - first + 1 ) / sliceSize )
-			coroutine.yield()
+				-- Faces.Sort estimates progress from the original material slices.
+				progress.done = progress.done + math.ceil( ( last - first + 1 ) / sliceSize )
+				coroutine.yield()
+			end
 		end
 		groups[key] = nil
 	end
