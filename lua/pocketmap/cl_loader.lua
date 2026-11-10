@@ -93,6 +93,7 @@ local function readEntities( mini, job )
 	mini:SetStatus( "Reading the entities", 0.03 )
 	job.entities = job.bsp:GetEntities()
 	coroutine.yield()
+	PocketMap.MapIO.Build( mini, job.entities )
 
 	PocketMap.Sky.Read( mini, job.entities )
 end

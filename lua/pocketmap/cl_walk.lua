@@ -354,6 +354,7 @@ function Walk.Enter(ent)
 	local pos, angles = randomClearSpawn(session)
 	if not pos then chat.AddText("[PocketMap] No clear player spawn was found in this map.") return end
 	session.move = setmetatable({ origin = pos, velocity = Vector(), angles = angles, moveAngles = angles, buttons = 0, oldButtons = 0, forward = 0, side = 0, up = 0, maxSpeed = 320, maxClientSpeed = 320, impulse = 0, constraintCenter = Vector(), constraintRadius = 0, constraintWidth = 0, constraintSpeedFactor = 1, finalStepHeight = 0, finalIdealVelocity = Vector(), finalJumpVelocity = Vector() }, { __index = Move })
+	session.io = PocketMap.MapIO.NewSession( mini )
 	session.yawOffset = angles.y - ply:EyeAngles().y
 	session.enteredAt = RealTime()
 	Walk.session = session
@@ -428,6 +429,7 @@ function runStep(ply, session, cmd, number)
 	mv.speedModified = false
 	mv.impulse = input.impulse
 	PocketMap.GamemodeMovement.Step(ply, mv, cmd, session)
+	PocketMap.MapIO.Step( session, engine.TickInterval() )
 	if isNoclippingOutsideBlock(session) then
 		Walk.Leave()
 	else
