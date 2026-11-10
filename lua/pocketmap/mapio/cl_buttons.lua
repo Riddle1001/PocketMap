@@ -73,7 +73,7 @@ IO.OnStep(function(session, state, dt)
 				button.goal, button.returnAt = 0, nil
 			end
 			if button.touchActivates then
-				local touching = IO.Overlaps(session, record)
+				local touching = not session.noclip and IO.Overlaps(session, record)
 				if touching and not button.touching then press(state, record) end
 				button.touching = touching
 			end

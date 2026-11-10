@@ -80,7 +80,9 @@ local function useFlatTargets( plane )
 	plane.cleared = false
 end
 
-local sharedFlats = {} -- fog color -> { reflect, refract, users }, for every block
+-- Preserve target ownership when this client file is hot-reloaded while a miniature exists.
+Water.sharedFlats = Water.sharedFlats or {}
+local sharedFlats = Water.sharedFlats -- fog color -> { reflect, refract, users }, for every block
 
 ---@return table? flat # { reflect, refract }, nil if the card can't make them
 local function acquireFlat( mini, fog )
@@ -113,12 +115,14 @@ end
 local function releaseFlats( mini )
 	for id in pairs( mini.waterFlats or {} ) do
 		local flat = sharedFlats[id]
-		flat.users = flat.users - 1
+		if flat then
+			flat.users = flat.users - 1
 
-		if flat.users == 0 then
-			PocketMap.RT.Release( flat.reflect )
-			PocketMap.RT.Release( flat.refract )
-			sharedFlats[id] = nil
+			if flat.users == 0 then
+				PocketMap.RT.Release( flat.reflect )
+				PocketMap.RT.Release( flat.refract )
+				sharedFlats[id] = nil
+			end
 		end
 	end
 	mini.waterFlats = nil
@@ -132,7 +136,10 @@ end
 
 -- Render targets can't be freed, so the number that ever exist is what counts: at most MAX_RENDERED_HEIGHTS heights hold full
 -- size targets at a time, across all blocks. A new one takes the targets of the one drawn longest ago.
-local heldHeights, heldCount = {}, 0
+-- Keep the full-size target budget across a clientside hot reload, just like the shared flat targets.
+Water.heldHeights = Water.heldHeights or {}
+local heldHeights, heldCount = Water.heldHeights, 0
+for _ in pairs( heldHeights ) do heldCount = heldCount + 1 end
 
 local function releaseHeightTargets( rec )
 	if not rec.reflect then return end
@@ -220,28 +227,55 @@ local function makePlane( mini, key, z, source, material )
 	return plane
 end
 
----The material is shared by every plane and block that uses it, so it gets its targets right before each draw and gives them back after.
-local function bind( plane )
+---A material can be shared by several planes. Save its original parameters once per draw and only update values that change.
+local function bind( plane, materials )
 	local material = plane.material
-	local saved = {
-		reflect = material:GetTexture( "$reflecttexture" ), refract = material:GetTexture( "$refracttexture" ),
-		expensive = material:GetInt( "$forceexpensive" ), fogStart = material:GetFloat( "$fogstart" ), fogEnd = material:GetFloat( "$fogend" ),
-	}
-	material:SetTexture( "$reflecttexture", plane.reflectRT )
-	material:SetTexture( "$refracttexture", plane.refractRT )
-	material:SetInt( "$forceexpensive", 1 ) -- the cheap water needs a cubemap the meshes don't have
-	material:SetFloat( "$fogstart", plane.fogStart )
-	material:SetFloat( "$fogend", plane.fogEnd )
-	return saved
+	local saved = materials[material]
+	local changed = false
+	if not saved then
+		saved = {
+			reflect = material:GetTexture( "$reflecttexture" ), refract = material:GetTexture( "$refracttexture" ),
+			expensive = material:GetInt( "$forceexpensive" ), fogStart = material:GetFloat( "$fogstart" ), fogEnd = material:GetFloat( "$fogend" ),
+		}
+		saved.currentReflect, saved.currentRefract = saved.reflect, saved.refract
+		saved.currentExpensive, saved.currentFogStart, saved.currentFogEnd = saved.expensive, saved.fogStart, saved.fogEnd
+		materials[material] = saved
+	end
+
+	if saved.currentReflect ~= plane.reflectRT then
+		material:SetTexture( "$reflecttexture", plane.reflectRT )
+		saved.currentReflect = plane.reflectRT
+		changed = true
+	end
+	if saved.currentRefract ~= plane.refractRT then
+		material:SetTexture( "$refracttexture", plane.refractRT )
+		saved.currentRefract = plane.refractRT
+		changed = true
+	end
+	if saved.currentExpensive ~= 1 then
+		material:SetInt( "$forceexpensive", 1 ) -- the cheap water needs a cubemap the meshes don't have
+		saved.currentExpensive = 1
+		changed = true
+	end
+	if saved.currentFogStart ~= plane.fogStart then
+		material:SetFloat( "$fogstart", plane.fogStart )
+		saved.currentFogStart = plane.fogStart
+		changed = true
+	end
+	if saved.currentFogEnd ~= plane.fogEnd then
+		material:SetFloat( "$fogend", plane.fogEnd )
+		saved.currentFogEnd = plane.fogEnd
+		changed = true
+	end
+	return changed
 end
 
-local function unbind( plane, saved )
-	local material = plane.material
-	material:SetTexture( "$reflecttexture", saved.reflect or ENGINE_REFLECTION )
-	material:SetTexture( "$refracttexture", saved.refract or ENGINE_REFRACTION )
-	material:SetInt( "$forceexpensive", saved.expensive or 0 )
-	material:SetFloat( "$fogstart", saved.fogStart or 0 )
-	material:SetFloat( "$fogend", saved.fogEnd or 0 )
+local function unbind( material, saved )
+	if saved.currentReflect ~= saved.reflect then material:SetTexture( "$reflecttexture", saved.reflect or ENGINE_REFLECTION ) end
+	if saved.currentRefract ~= saved.refract then material:SetTexture( "$refracttexture", saved.refract or ENGINE_REFRACTION ) end
+	if saved.currentExpensive ~= saved.expensive then material:SetInt( "$forceexpensive", saved.expensive or 0 ) end
+	if saved.currentFogStart ~= saved.fogStart then material:SetFloat( "$fogstart", saved.fogStart or 0 ) end
+	if saved.currentFogEnd ~= saved.fogEnd then material:SetFloat( "$fogend", saved.fogEnd or 0 ) end
 end
 
 ---A target that was never drawn into holds garbage, so planes with no effects are filled with their fog color.
@@ -267,8 +301,10 @@ local function buildMeshes( plane, faces )
 				local p = v.pos
 				if p.x < plane.mins.x then plane.mins.x = p.x end
 				if p.y < plane.mins.y then plane.mins.y = p.y end
+				if p.z < plane.mins.z then plane.mins.z = p.z end
 				if p.x > plane.maxs.x then plane.maxs.x = p.x end
 				if p.y > plane.maxs.y then plane.maxs.y = p.y end
+				if p.z > plane.maxs.z then plane.maxs.z = p.z end
 			end
 		end
 		face:ClearMeshData()
@@ -368,9 +404,12 @@ function Water.Build( mini, key, material, faces )
 	if not loose then return rest end
 
 	loose.loose, loose.faces = true, #rest
+	-- Loose water is sloped, so its bounds must include its actual Z range.
+	loose.mins.z, loose.maxs.z = math.huge, -math.huge
 	mini.waterLoose = mini.waterLoose or {}
 	mini.waterLoose[#mini.waterLoose + 1] = loose
 	buildMeshes( loose, rest )
+	loose.bounds3D = true
 	return {}
 end
 
@@ -388,26 +427,69 @@ function Water.Free( mini )
 	releaseFlats( mini )
 end
 
----Not drawn inside its own reflection and refraction.
-function Water.Draw( mini )
-	local planes, loose = mini.waterPlanes, mini.waterLoose
-	if Water.pass or not planes or ( #planes == 0 and not loose ) then return end
+local boxVisible, planeWorldBounds
 
-	cam.PushModelMatrix( mini.matrix )
-	for _, list in ipairs( { planes, loose or {} } ) do
-		for _, plane in ipairs( list ) do
-			local saved = bind( plane )
-			render.SetMaterial( plane.material )
-			for _, m in ipairs( plane.meshes ) do m:Draw() end
-			unbind( plane, saved )
+---Only cull against the main camera when the recorded view matches the one actually drawing.
+---Nested cameras and older, already loaded loose water keep their original behavior.
+local function drawView()
+	if render.GetRenderTarget and render.GetRenderTarget() then return end
+	local view = Water.view
+	if not view or view.frame ~= FrameNumber() or not view.origin or not view.angles or not view.fov or view.fov <= 0 or view.fov >= 170 then return end
+	if EyePos():DistToSqr( view.origin ) > 1 then return end
+	if EyeAngles():Forward():Dot( view.angles:Forward() ) < 0.999 then return end
+	-- NoteView replaces this record when the camera changes; both render passes
+	-- can reuse the same frustum instead of building it twice per miniature.
+	if not view.waterDrawView then
+		view.waterDrawView = { origin = view.origin, angles = view.angles, fov = view.fov,
+			aspect = ScrW() / math.max( ScrH(), 1 ) }
+	end
+	return view.waterDrawView
+end
+
+local function drawPlanes( mini, planes, materials, currentMaterial, view )
+	for _, plane in ipairs( planes ) do
+		if #plane.meshes > 0 then
+			local visible = true
+			if view and ( not plane.loose or plane.bounds3D ) then
+				local mins, maxs = planeWorldBounds( mini, plane )
+				if mins then visible = boxVisible( mins, maxs, 1, view ) end
+			end
+			if visible then
+				local changed = bind( plane, materials )
+				if changed or currentMaterial ~= plane.material then
+					render.SetMaterial( plane.material )
+					currentMaterial = plane.material
+				end
+				for _, m in ipairs( plane.meshes ) do m:Draw() end
+			end
 		end
 	end
+	return currentMaterial
+end
+
+local function drawWater( mini, planes, loose, materials, view )
+	local currentMaterial = drawPlanes( mini, planes, materials, nil, view )
+	if loose then drawPlanes( mini, loose, materials, currentMaterial, view ) end
+end
+
+---Not drawn inside its own reflection and refraction. Restore shared material parameters even if a mesh fails to draw.
+function Water.Draw( mini )
+	local planes, loose = mini.waterPlanes, mini.waterLoose
+	if Water.pass or not planes or ( #planes == 0 and ( not loose or #loose == 0 ) ) then return end
+
+	local view = drawView()
+	local materials = {}
+	cam.PushModelMatrix( mini.matrix )
+	local ok, err = pcall( drawWater, mini, planes, loose, materials, view )
+	for material, saved in pairs( materials ) do unbind( material, saved ) end
 	cam.PopModelMatrix()
+	if not ok then error( err, 0 ) end
 end
 
 ---The shader looks the reflection up with the projection of the main view, so nested views need the same one. A point is projected
 ---by both, and since screen position scales with 1 / tan( fov / 2 ) the ratio gives the fov that makes them match.
 function Water.Calibrate()
+	if Water.broken or not cvWater:GetBool() then return end
 	local setup = render.GetViewSetup()
 	if not setup then return end
 
@@ -445,34 +527,24 @@ function Water.NoteView( origin, angles, fov, znear, zfar )
 	Water.view = { origin = origin, angles = angles, fov = fov, znear = znear, zfar = zfar, frame = FrameNumber() }
 end
 
----Conservative: false only when all 8 corners are behind the eye or past the same side of the view.
-local function boxVisible( mins, maxs, pad, view )
-	local forward, right, up = view.angles:Forward(), view.angles:Right(), view.angles:Up()
-	local aspect = view.aspect
-	local halfH = math.tan( math.rad( view.fov ) / 2 ) * math.max( 1, aspect / ( 4 / 3 ) ) * 1.3
-	local halfV = halfH / aspect
-
-	local outside = { 0, 0, 0, 0, 0 } -- behind, left, right, below, above
-	local zs = { mins.z - pad, maxs.z + pad }
-	for _, x in ipairs( { mins.x, maxs.x } ) do
-		for _, y in ipairs( { mins.y, maxs.y } ) do
-			for _, z in ipairs( zs ) do
-				local rel = Vector( x, y, z ) - view.origin
-				local depth = rel:Dot( forward )
-				if depth <= 0 then
-					outside[1] = outside[1] + 1
-				else
-					local sx, sy = rel:Dot( right ), rel:Dot( up )
-					if sx < -halfH * depth then outside[2] = outside[2] + 1 end
-					if sx > halfH * depth then outside[3] = outside[3] + 1 end
-					if sy < -halfV * depth then outside[4] = outside[4] + 1 end
-					if sy > halfV * depth then outside[5] = outside[5] + 1 end
-				end
-			end
-		end
+---Conservative frustum test of an axis-aligned box. The support radius keeps intersecting boxes visible.
+boxVisible = function( mins, maxs, pad, view )
+	local frustum = view.frustum
+	if not frustum then
+		local forward, right, up = view.angles:Forward(), view.angles:Right(), view.angles:Up()
+		local halfH = math.tan( math.rad( view.fov ) / 2 ) * math.max( 1, view.aspect / ( 4 / 3 ) ) * 1.3
+		local halfV = halfH / view.aspect
+		frustum = { forward, forward * halfH + right, forward * halfH - right, forward * halfV + up, forward * halfV - up }
+		view.frustum = frustum
 	end
-	for i = 1, 5 do
-		if outside[i] >= 8 then return false end
+
+	local x, y, z = ( mins.x + maxs.x ) * 0.5, ( mins.y + maxs.y ) * 0.5, ( mins.z + maxs.z ) * 0.5
+	local dx, dy, dz = x - view.origin.x, y - view.origin.y, z - view.origin.z
+	local ex, ey, ez = ( maxs.x - mins.x ) * 0.5 + pad, ( maxs.y - mins.y ) * 0.5 + pad, ( maxs.z - mins.z ) * 0.5 + pad
+	for _, normal in ipairs( frustum ) do
+		local distance = dx * normal.x + dy * normal.y + dz * normal.z
+		local radius = ex * math.abs( normal.x ) + ey * math.abs( normal.y ) + ez * math.abs( normal.z )
+		if distance + radius < 0 then return false end
 	end
 	return true
 end
@@ -565,10 +637,11 @@ local function renderPlane( mini, plane, zWorld, spread, view )
 	renderRefraction( mini, plane, zWorld, spread, view )
 
 	if hdr then render.SetToneMappingScaleLinear( toneScale * REFLECTION_TONE_SCALE ) end
-	renderReflection( mini, plane, zWorld, spread, view )
+	local ok, err = pcall( renderReflection, mini, plane, zWorld, spread, view )
 	if toneScale then render.SetToneMappingScaleLinear( toneScale ) end
 
 	Water.pass = nil
+	if not ok then error( err, 0 ) end
 end
 
 local WATER_MAX_TILT = 0.5
@@ -609,22 +682,31 @@ local function isBlockLevel( ent )
 	return math.abs( math.NormalizeAngle( ang.p ) ) < WATER_MAX_TILT and math.abs( math.NormalizeAngle( ang.r ) ) < WATER_MAX_TILT
 end
 
----The box of the water of a plane in the world, and its height.
-local function planeWorldBounds( mini, plane )
+---The water plane's bounds in world space, also used for culling its draw call.
+planeWorldBounds = function( mini, plane )
+	if mini.matrixFrame and plane.worldFrame == mini.matrixFrame then
+		return plane.worldMins, plane.worldMaxs, plane.worldHeight
+	end
+	if plane.mins.x > plane.maxs.x or plane.mins.y > plane.maxs.y or plane.mins.z > plane.maxs.z then return end
+
 	local m = mini.matrix
 	local wmins = Vector( math.huge, math.huge, math.huge )
 	local wmaxs = Vector( -math.huge, -math.huge, -math.huge )
-	local height
+	local height = ( m * Vector( plane.mins.x, plane.mins.y, plane.z ) ).z
 
 	for _, x in ipairs( { plane.mins.x, plane.maxs.x } ) do
 		for _, y in ipairs( { plane.mins.y, plane.maxs.y } ) do
-			local corner = m * Vector( x, y, plane.z )
-			height = height or corner.z
-			wmins.x, wmins.y, wmins.z = math.min( wmins.x, corner.x ), math.min( wmins.y, corner.y ), math.min( wmins.z, corner.z )
-			wmaxs.x, wmaxs.y, wmaxs.z = math.max( wmaxs.x, corner.x ), math.max( wmaxs.y, corner.y ), math.max( wmaxs.z, corner.z )
+			for _, z in ipairs( { plane.mins.z, plane.maxs.z } ) do
+				local corner = m * Vector( x, y, z )
+				wmins.x, wmins.y, wmins.z = math.min( wmins.x, corner.x ), math.min( wmins.y, corner.y ), math.min( wmins.z, corner.z )
+				wmaxs.x, wmaxs.y, wmaxs.z = math.max( wmaxs.x, corner.x ), math.max( wmaxs.y, corner.y ), math.max( wmaxs.z, corner.z )
+			end
 		end
 	end
 
+	if mini.matrixFrame then
+		plane.worldFrame, plane.worldMins, plane.worldMaxs, plane.worldHeight = mini.matrixFrame, wmins, wmaxs, height
+	end
 	return wmins, wmaxs, height
 end
 
@@ -712,7 +794,7 @@ local function clearIdlePlanes( mini )
 end
 
 PocketMap.Hooks.Register( "PreRender", "PocketMap_Water", function()
-	if not PocketMap.Active then return end
+	if Water.pass or not PocketMap.Active then return end
 
 	local view = currentEffectsView()
 

@@ -68,14 +68,46 @@ end
 
 ---The reflection and refraction of the water are a second and third draw of the map, so they only get the opaque world:
 ---no props, plants or glass, which is most of the cost of a draw.
+local function drawWorld( mini, options, translucent )
+	local objects = mini.objects
+	local meshes = translucent and objects.translucentMeshes or objects.opaqueMeshes
+	local batched = meshes and options.lightmap and not options.lightOnly and not options.ignoreZ
+	if batched and #meshes == 0 then return end
+	if not batched and #objects == 0 then return end
+
+	cam.PushModelMatrix( mini.matrix )
+	if batched then
+		-- One matrix and lightmap binding for all material slices of the static world.
+		-- The ordering of the meshes within each pass stays the same as MeshBuilder's.
+		if translucent then render.OverrideDepthEnable( true, false ) end
+		render.SetLightmapTexture( options.lightmap )
+		local lastMaterial
+		for i = 1, #meshes do
+			local part = meshes[i]
+			if part.material ~= lastMaterial then
+				render.SetMaterial( part.material )
+				lastMaterial = part.material
+			end
+			part.mesh:Draw()
+		end
+		if translucent then render.OverrideDepthEnable( false ) end
+	else
+		-- Older loaded miniatures and maps without a lightmap use NikNaks' original drawing path.
+		for i = 1, #objects do
+			if translucent then objects[i]:DrawTranslucent( nil, options )
+			else objects[i]:DrawOpaque( nil, options ) end
+		end
+	end
+	cam.PopModelMatrix()
+end
+
 ---@param pass "opaque"|"translucent"|nil # nil draws both halves
 local function drawContents( mini, options, pass )
-	local matrix, objects = mini.matrix, mini.objects
 	local lite = Water.pass ~= nil
 	local doOpaque, doTranslucent = pass ~= "translucent", pass ~= "opaque" and not lite
 
 	if doOpaque then
-		for i = 1, #objects do objects[i]:DrawOpaque( matrix, options ) end
+		drawWorld( mini, options, false )
 		PocketMap.MapIO.Draw(mini, options, false)
 		Water.Draw( mini )
 
@@ -95,7 +127,7 @@ local function drawContents( mini, options, pass )
 			render.OverrideDepthEnable( true, true )
 		end
 
-		for i = 1, #objects do objects[i]:DrawTranslucent( matrix, options ) end
+		drawWorld( mini, options, true )
 		PocketMap.MapIO.Draw(mini, options, true)
 		render.OverrideDepthEnable( true, true )
 	end

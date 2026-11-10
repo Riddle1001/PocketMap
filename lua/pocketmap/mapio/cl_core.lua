@@ -192,6 +192,9 @@ end
 
 function IO.Input(session, target, input, parameter, activator, caller)
 	if not target then return end
+	-- Inputs may also arrive between render hooks (e.g. a use event).
+	-- Invalidate the shared brush visibility list even without a movement tick.
+	session.drawRevision = (session.drawRevision or 0) + 1
 	input = input:lower()
 	local current = IO.State(session, target)
 	local handlers = IO.classes[target.class]
@@ -440,9 +443,52 @@ function IO.Use(session, state)
 end
 
 -- Faces and collision of moving brush entities must stay out of the baked static world.
+local function meshPasses(mesh)
+	local opaque, translucent = false, false
+	for _, part in ipairs(mesh:GetMeshes()) do
+		if part.translucent then translucent = true else opaque = true end
+	end
+	for _, part in ipairs(mesh:GetLightMeshes()) do
+		if part.translucent then translucent = true else opaque = true end
+	end
+	return opaque, translucent
+end
+
+local ZERO_ANGLE = Angle()
+local PVS_MAX_RADIUS = 2048
+local PVS_MAX_LEAFS = 128
+
+-- Use the same vertices NikNaks puts in its brush meshes: GetVertexs() omits
+-- the bmodel transform applied by GenerateVertexTriangleData(). A missing
+-- bound leaves the brush visible. Displacements have GPU-smoothed geometry.
+local function brushBounds(faces, record)
+	local minX, minY, minZ = math.huge, math.huge, math.huge
+	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+	for _, face in ipairs(faces) do
+		if face:IsDisplacement() then return end
+		local vertices = face:GenerateVertexTriangleData()
+		if not vertices or #vertices < 3 then return end
+		for _, vertex in ipairs(vertices) do
+			local point = vertex.pos
+			if not point then return end
+			minX, minY, minZ = math.min(minX, point.x), math.min(minY, point.y), math.min(minZ, point.z)
+			maxX, maxY, maxZ = math.max(maxX, point.x), math.max(maxY, point.y), math.max(maxZ, point.z)
+		end
+	end
+	if minX == math.huge or maxX == math.huge or minX ~= minX or maxX ~= maxX
+		or minY ~= minY or maxY ~= maxY or minZ ~= minZ or maxZ ~= maxZ then return end
+	local center = Vector((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5)
+	local radius = Vector(maxX - minX, maxY - minY, maxZ - minZ):Length() * 0.5 + 2
+	if radius ~= radius or radius >= math.huge then return end
+	return WorldToLocal(center, ZERO_ANGLE, record.origin, record.angles), radius
+end
+
 function IO.BuildMeshes(mini, job)
 	mini.dynamicMeshes = {}
+	mini.dynamicOpaque, mini.dynamicTranslucent = {}, {}
+	mini.mapIOPassesSource, mini.mapIODrawCache = mini.dynamicMeshes, nil
 	for record, faces in pairs(job.dynamicFaces or {}) do
+		local localCenter, radius = brushBounds(faces, record)
 		local builder = NikNaks.MeshBuilder()
 		for _, face in ipairs(faces) do
 			job.addOptions.material = job.materials[face:GetTexture() or "?"]
@@ -453,21 +499,222 @@ function IO.BuildMeshes(mini, job)
 		inverse:SetTranslation(record.origin)
 		inverse:SetAngles(record.angles)
 		inverse:Invert()
-		mini.dynamicMeshes[#mini.dynamicMeshes + 1] = { record = record, mesh = builder:Build(), inverse = inverse, matrix = Matrix() }
+		local mesh = builder:Build()
+		local opaque, translucent = meshPasses(mesh)
+		local item = {
+			record = record, mesh = mesh, inverse = inverse, matrix = Matrix(),
+			opaque = opaque, translucent = translucent,
+			localCenter = localCenter, radius = radius,
+		}
+		mini.dynamicMeshes[#mini.dynamicMeshes + 1] = item
+		if opaque then mini.dynamicOpaque[#mini.dynamicOpaque + 1] = item end
+		if translucent then mini.dynamicTranslucent[#mini.dynamicTranslucent + 1] = item end
 		coroutine.yield()
 	end
+end
+
+-- Existing miniatures can survive Lua auto-refresh. Index their compiled
+-- meshes on demand instead of scanning every brush in both render passes.
+local function passMeshes(mini, translucent)
+	if mini.mapIOPassesSource ~= mini.dynamicMeshes or not mini.dynamicOpaque or not mini.dynamicTranslucent then
+		local opaque, transparent = {}, {}
+		for _, item in ipairs(mini.dynamicMeshes or {}) do
+			if item.opaque == nil then item.opaque, item.translucent = meshPasses(item.mesh) end
+			if item.opaque then opaque[#opaque + 1] = item end
+			if item.translucent then transparent[#transparent + 1] = item end
+		end
+		mini.dynamicOpaque, mini.dynamicTranslucent = opaque, transparent
+		mini.mapIOPassesSource, mini.mapIODrawCache = mini.dynamicMeshes, nil
+	end
+	return translucent and mini.dynamicTranslucent or mini.dynamicOpaque
+end
+
+-- The miniature's transform is constant while its block is still. Keep one
+-- stamp for all brush models so their matrices survive repeated render passes.
+local function drawStamp(mini)
+	if mini.matrixFrame and mini.mapIODrawFrame == mini.matrixFrame then return mini.mapIODrawStamp end
+	mini.mapIODrawFrame = mini.matrixFrame
+	local pos, ang = mini.ent:GetPos(), mini.ent:GetAngles()
+	if not mini.mapIODrawStamp or mini.mapIODrawX ~= pos.x or mini.mapIODrawY ~= pos.y or mini.mapIODrawZ ~= pos.z
+		or mini.mapIODrawPitch ~= ang.p or mini.mapIODrawYaw ~= ang.y or mini.mapIODrawRoll ~= ang.r then
+		mini.mapIODrawStamp = (mini.mapIODrawStamp or 0) + 1
+		mini.mapIODrawX, mini.mapIODrawY, mini.mapIODrawZ = pos.x, pos.y, pos.z
+		mini.mapIODrawPitch, mini.mapIODrawYaw, mini.mapIODrawRoll = ang.p, ang.y, ang.r
+	end
+	return mini.mapIODrawStamp
+end
+
+-- Only the primary recorded view has a known camera. Reflection targets and
+-- other render views can use a different frustum, so draw everything in them.
+local function drawView(mini)
+	if PocketMap.Water and PocketMap.Water.pass then return end
+	if render.GetRenderTarget and render.GetRenderTarget() then return end
+	local water = PocketMap.Water
+	local view = water and water.view
+	if not view or view.frame ~= FrameNumber() or not view.origin or not view.angles
+		or not view.fov or view.fov <= 0 or view.fov >= 170 then return end
+	if EyePos():DistToSqr(view.origin) > 1 then return end
+	if EyeAngles():Forward():Dot(view.angles:Forward()) < 0.999 then return end
+	if view.mapIOFrustum then return view end
+
+	local forward, right, up = view.angles:Forward(), view.angles:Right(), view.angles:Up()
+	local aspect = ScrW() / math.max(ScrH(), 1)
+	local halfH = math.tan(math.rad(view.fov) * 0.5) * math.max(1, aspect / (4 / 3)) * 1.3
+	local halfV = halfH / aspect
+	local normals = { forward, forward * halfH + right, forward * halfH - right,
+		forward * halfV + up, forward * halfV - up }
+	for _, normal in ipairs(normals) do normal:Normalize() end
+	view.mapIOFrustum = normals
+	return view
+end
+
+-- Re-evaluate PVS when the viewer enters another BSP cluster, not each draw.
+-- A missing or invalid vis lump is never sufficient evidence to hide a brush.
+local function drawPVS(mini, walk, view)
+	if not walk or walk.mini ~= mini or not walk.io or not view or not mini.scale or mini.scale <= 0
+		or not mini.bsp or not mini:EyeInside() then return end
+	local bsp = mini.bsp
+	local eye = (mini.ent:WorldToLocal(view.origin) - mini.boxCenter) / mini.scale + mini.mapCenter
+	local cluster = bsp:ClusterFromPoint(eye)
+	if not cluster or cluster < 0 then return end
+	local vis = bsp:GetVisibility()
+	if not vis or not vis.VisData or not vis.VisData[cluster] or bsp:IsVisibilityCorrupted() then return end
+	if mini.mapIOPVSCluster ~= cluster or mini.mapIOPVSBSP ~= bsp then
+		mini.mapIOPVSCluster, mini.mapIOPVSBSP = cluster, bsp
+		mini.mapIOPVS = bsp:PVSForOrigin(eye)
+	end
+	return mini.mapIOPVS
+end
+
+-- A sphere encompassing the brush can span several visibility leaves. Cull
+-- only if every valid cluster it touches is absent from the current PVS.
+local function brushClusters(bsp, item)
+	if not item.mapCenter or not item.radius or item.radius > PVS_MAX_RADIUS then return end
+	local leaves = bsp:SphereInLeafs(0, item.mapCenter, item.radius + 2)
+	if #leaves == 0 or #leaves > PVS_MAX_LEAFS then return end
+	local clusters, seen = {}, {}
+	for _, leaf in ipairs(leaves) do
+		local cluster = leaf and leaf.cluster
+		if not cluster then return end
+		if cluster < 0 then
+			if not leaf.contents or bit.band(leaf.contents, CONTENTS_SOLID) == 0 then return end
+		elseif not seen[cluster] then
+			seen[cluster] = true
+			clusters[#clusters + 1] = cluster
+		end
+	end
+	if #clusters > 0 then return clusters end
+end
+
+local function brushVisible(mini, item, view, pvs, poseChanged, stamp)
+	if not view or not item.localCenter then return true end
+	-- The opaque and translucent hooks often render the same brush and camera.
+	if item.visibleView == view and item.visibleStamp == stamp and item.visiblePose == item.pose
+		and item.visiblePVS == pvs then
+		return item.visibleResult
+	end
+	local visible = true
+	if pvs then
+		if not item.clustersChecked then
+			item.clusters = brushClusters(mini.bsp, item)
+			item.clustersChecked = true
+		end
+		if item.clusters then
+			if item.checkedPVS ~= pvs then
+				item.checkedPVS, item.pvsVisible = pvs, false
+				for _, cluster in ipairs(item.clusters) do
+					if pvs[cluster] then item.pvsVisible = true break end
+				end
+			end
+			if not item.pvsVisible then visible = false end
+		end
+	end
+
+	if visible then
+		if poseChanged or item.worldStamp ~= stamp then
+			item.worldCenter = mini.matrix * item.mapCenter
+			item.worldStamp = stamp
+		end
+		local delta = item.worldCenter - view.origin
+		local radius = item.radius * mini.scale
+		for _, normal in ipairs(view.mapIOFrustum) do
+			if delta:Dot(normal) < -radius then visible = false break end
+		end
+	end
+	item.visibleView, item.visibleStamp, item.visiblePose, item.visiblePVS, item.visibleResult = view, stamp, item.pose, pvs, visible
+	return visible
+end
+
+
+-- Pose, cull and transform once for a matching pair of main-view render
+-- passes. Always prepare afresh for mirrors, water and unknown cameras.
+local function visibleMeshes(mini, state, view, pvs, stamp, opaque, transparent)
+	opaque, transparent = opaque or {}, transparent or {}
+	-- Reuse the prior main-view lists, retaining their capacity across frames.
+	-- Unknown cameras get independent temporary lists.
+	for i = #opaque, 1, -1 do opaque[i] = nil end
+	for i = #transparent, 1, -1 do transparent[i] = nil end
+	for _, item in ipairs(mini.dynamicMeshes or {}) do
+		if item.opaque or item.translucent then
+			local origin = IO.Position(state, item.record)
+			local angles = IO.Rotation(state, item.record)
+			local poseChanged = item.x ~= origin.x or item.y ~= origin.y or item.z ~= origin.z
+				or item.pitch ~= angles.p or item.yaw ~= angles.y or item.roll ~= angles.r
+			if poseChanged then
+				item.x, item.y, item.z = origin.x, origin.y, origin.z
+				item.pitch, item.yaw, item.roll = angles.p, angles.y, angles.r
+				item.pose = (item.pose or 0) + 1
+				if item.localCenter then item.mapCenter = LocalToWorld(item.localCenter, ZERO_ANGLE, origin, angles) end
+				item.clustersChecked, item.clusters, item.checkedPVS = nil, nil, nil
+			end
+			if brushVisible(mini, item, view, pvs, poseChanged, stamp) then
+				if item.stamp ~= stamp or item.matrixPose ~= item.pose then
+					local matrix = item.matrix
+					matrix:Set(mini.matrix)
+					matrix:Translate(origin)
+					matrix:Rotate(angles)
+					matrix:Mul(item.inverse)
+					item.stamp = stamp
+					item.matrixPose = item.pose
+				end
+				if item.opaque then opaque[#opaque + 1] = item end
+				if item.translucent then transparent[#transparent + 1] = item end
+			end
+		end
+	end
+	return opaque, transparent
 end
 
 function IO.Draw(mini, options, translucent)
 	local walk = PocketMap.Walk and PocketMap.Walk.session
 	local state = walk and walk.mini == mini and walk.io
-	for _, item in ipairs(mini.dynamicMeshes or {}) do
-		local matrix = item.matrix
-		matrix:Set(mini.matrix)
-		matrix:Translate(IO.Position(state, item.record))
-		matrix:Rotate(IO.Rotation(state, item.record))
-		matrix:Mul(item.inverse)
-		if translucent then item.mesh:DrawTranslucent(matrix, options) else item.mesh:DrawOpaque(matrix, options) end
+	local pass = passMeshes(mini, translucent)
+	if #pass > 0 then
+		local view = not (options and (options.ignoreZ or options.lightOnly)) and drawView(mini)
+		local stamp = drawStamp(mini)
+		local frame = FrameNumber()
+		local cache = mini.mapIODrawCache
+		local time = state and state.time
+		local revision = state and state.drawRevision
+		if not view or not cache or cache.frame ~= frame or cache.view ~= view
+			or cache.state ~= state or cache.time ~= time or cache.revision ~= revision
+			or cache.stamp ~= stamp or cache.source ~= mini.dynamicMeshes then
+			local pvs = drawPVS(mini, walk, view)
+			if not view then cache = nil end
+			local opaque, transparent = visibleMeshes(mini, state, view, pvs, stamp,
+				cache and cache.opaque, cache and cache.translucent)
+			cache = cache or {}
+			cache.frame, cache.view, cache.state, cache.time = frame, view, state, time
+			cache.revision, cache.stamp, cache.source = revision, stamp, mini.dynamicMeshes
+			cache.opaque, cache.translucent = opaque, transparent
+			if view then mini.mapIODrawCache = cache end
+		end
+		local visible = translucent and cache.translucent or cache.opaque
+		for i = 1, #visible do
+			local item = visible[i]
+			if translucent then item.mesh:DrawTranslucent(item.matrix, options)
+			else item.mesh:DrawOpaque(item.matrix, options) end
+		end
 	end
 	for _, callback in ipairs(IO.draws) do callback(mini, state, translucent) end
 end
@@ -475,6 +722,8 @@ end
 function IO.Destroy(mini)
 	for _, item in ipairs(mini.dynamicMeshes or {}) do item.mesh:Destroy() end
 	mini.dynamicMeshes = nil
+	mini.dynamicOpaque, mini.dynamicTranslucent = nil, nil
+	mini.mapIOPassesSource, mini.mapIODrawCache = nil, nil
 	if IsValid and IsValid(mini.mapIODoorProp) then mini.mapIODoorProp:Remove() end
 	mini.mapIODoorProp = nil
 end

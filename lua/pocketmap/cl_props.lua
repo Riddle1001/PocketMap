@@ -3,7 +3,7 @@
 
 if not PocketMap.Mini then return end
 
-PocketMap.Props = {}
+PocketMap.Props = PocketMap.Props or {}
 local Props = PocketMap.Props
 local Entities = PocketMap.Entities
 
@@ -12,6 +12,13 @@ local RENDERMODE_DONT_RENDER = 10
 local EF_NODRAW = 32
 local MISSING_NAMES_KEPT = 8
 local SIDES = 6
+local PVS_BOUNDS_PAD = 4
+local PVS_MAX_BOUNDS_SPAN = 1024
+local PVS_MAX_LEAFS = 128
+local CONTENTS_SOLID = 1
+local FRUSTUM_PAD = 4
+local FRUSTUM_FOV_PAD = 3
+local ZERO_ANGLE = Angle()
 
 local DRAW_FLAGS = bit.bor( STUDIO_RENDER or 1, STUDIO_DRAWTRANSLUCENTSUBMODELS or 4 )
 local OPAQUE_FLAGS = STUDIO_RENDER or 1
@@ -199,18 +206,87 @@ local function needsSequencePose( mini, props, path )
 	return false
 end
 
+-- Keep every cluster touched by the model's padded, rotated bounds in map space.
+-- A leaf without visibility information makes the prop ineligible for PVS culling.
+local function propClusters( bsp, prop, mins, maxs )
+	if not mins or not maxs then return nil end
+	local scale = prop.UniformScale or 1
+	if scale <= 0 or scale >= math.huge or scale ~= scale then return nil end
+
+	local minX, minY, minZ = math.huge, math.huge, math.huge
+	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+	for x = 0, 1 do for y = 0, 1 do for z = 0, 1 do
+		local corner = Vector(
+			( x == 0 and mins.x or maxs.x ) * scale,
+			( y == 0 and mins.y or maxs.y ) * scale,
+			( z == 0 and mins.z or maxs.z ) * scale
+		)
+		local point = LocalToWorld( corner, ZERO_ANGLE, prop.Origin, prop.Angles )
+		minX, minY, minZ = math.min( minX, point.x ), math.min( minY, point.y ), math.min( minZ, point.z )
+		maxX, maxY, maxZ = math.max( maxX, point.x ), math.max( maxY, point.y ), math.max( maxZ, point.z )
+	end end end
+
+	-- Large bounds can touch thousands of BSP leaves; leave such models visible.
+	if minX <= -math.huge or maxX >= math.huge or
+		minY <= -math.huge or maxY >= math.huge or minZ <= -math.huge or maxZ >= math.huge or
+		maxX - minX > PVS_MAX_BOUNDS_SPAN or maxY - minY > PVS_MAX_BOUNDS_SPAN or
+		maxZ - minZ > PVS_MAX_BOUNDS_SPAN then return nil end
+
+	local leaves = bsp:AABBInLeafs( 0, Vector( minX, minY, minZ ), Vector( maxX, maxY, maxZ ), PVS_BOUNDS_PAD )
+	if #leaves == 0 or #leaves > PVS_MAX_LEAFS then return nil end
+
+	local clusters, seen = {}, {}
+	for _, leaf in ipairs( leaves ) do
+		if not leaf or not leaf.cluster then return nil end
+		if leaf.cluster < 0 then
+			-- Solid BSP space cannot be viewed; any other unknown leaf must fail open.
+			if not leaf.contents or bit.band( leaf.contents, CONTENTS_SOLID ) == 0 then return nil end
+		elseif not seen[leaf.cluster] then
+			seen[leaf.cluster] = true
+			clusters[#clusters + 1] = leaf.cluster
+		end
+	end
+
+	if #clusters == 1 then return clusters[1] end
+	if #clusters > 1 then return nil, clusters end
+end
+
+local function modelBounds( mini, path )
+	local entity = propEntity( mini )
+	entity:SetModel( path )
+	local mins, maxs = entity:GetModelRenderBounds()
+	return mins, maxs
+end
+
+-- A sphere enclosing the model in block space. Animated props have no reliable fixed bounds.
+local function propSphere( mini, prop, mins, maxs, blockScale )
+	if not mins or not maxs then return nil end
+	local scale = ( prop.UniformScale or 1 ) * blockScale
+	if scale <= 0 or scale >= math.huge or scale ~= scale then return nil end
+
+	local center = ( mins + maxs ) * ( ( prop.UniformScale or 1 ) * 0.5 )
+	local mapCenter = LocalToWorld( center, ZERO_ANGLE, prop.Origin, prop.Angles )
+	local radius = ( maxs - mins ):Length() * scale * 0.5 + FRUSTUM_PAD * blockScale
+	if radius >= math.huge or radius ~= radius then return nil end
+	return ( mapCenter - mini.mapCenter ) * blockScale + mini.boxCenter, radius
+end
+
 ---Props are placed relative to the block, so each frame only needs the block's transform.
 local function newPlacer( mini, job, light )
 	local scale = job.scale
 
 	return {
-		inBlock = function( prop )
+		inBlock = function( prop, mins, maxs )
+			local pvsCluster, pvsClusters = propClusters( job.bsp, prop, mins, maxs )
+			local sphereCenter, sphereRadius = propSphere( mini, prop, mins, maxs, scale )
 			return {
 				lpos = ( prop.Origin - mini.mapCenter ) * scale + mini.boxCenter,
 				langles = prop.Angles,
 				skin = prop.Skin or 0,
 				lscale = ( prop.UniformScale or 1 ) * scale,
 				light = light:Of( prop ),
+				pvsCluster = pvsCluster, pvsClusters = pvsClusters,
+				lcenter = sphereCenter, sphereRadius = sphereRadius,
 			}
 		end,
 
@@ -229,13 +305,14 @@ end
 local function placeModel( mini, placer, props, path, anim, bakeMeshes )
 	local kept, skyKept, keptPosed = {}, {}, {}
 	local posed = not anim and needsSequencePose( mini, props, path )
+	local mins, maxs = modelBounds( mini, path )
 
 	for _, prop in ipairs( props ) do
 		if prop.Sky then
 			skyKept[#skyKept + 1] = placer.inSkyRoom( prop )
 		else
 			local list = ( posed and prop.EntityProp ) and keptPosed or kept
-			list[#list + 1] = placer.inBlock( prop )
+			list[#list + 1] = placer.inBlock( prop, ( anim or ( posed and prop.EntityProp ) ) and nil or mins, maxs )
 		end
 	end
 
@@ -258,6 +335,7 @@ end
 function Props.Place( mini, job, lightToggle, bakeMeshes )
 	local bsp = job.bsp
 	local hdr = mini.lighting == "HDR"
+	mini.propPVSCluster, mini.propPVS, mini.propPVSBSP = nil, nil, nil
 
 	mini:SetStatus( "Reading the ambient light", 0.645 )
 	PocketMap.PropLight.Prepare( bsp, hdr )
@@ -265,6 +343,7 @@ function Props.Place( mini, job, lightToggle, bakeMeshes )
 
 	local placer = newPlacer( mini, job, PocketMap.PropLight.New( mini, bsp, lightToggle ) )
 	local errorProps = {}
+	local errorMins, errorMaxs = modelBounds( mini, "models/error.mdl" )
 
 	for index, key in ipairs( job.models ) do
 		local path, anim = key, nil
@@ -277,7 +356,7 @@ function Props.Place( mini, job, lightToggle, bakeMeshes )
 			placeModel( mini, placer, props, path, anim, bakeMeshes or PocketMap.PropMesh.IsStaticOnly( path ) )
 		else
 			for _, prop in ipairs( props ) do
-				if not prop.Sky then errorProps[#errorProps + 1] = placer.inBlock( prop ) end
+				if not prop.Sky then errorProps[#errorProps + 1] = placer.inBlock( prop, errorMins, errorMaxs ) end
 			end
 			noteMissingModel( mini, path, #props )
 		end
@@ -363,46 +442,118 @@ local function updateStamp( mini )
 	return mini.stamp, pos, ang
 end
 
-local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng )
+local function visibleInPVS( prop, pvs )
+	if not pvs then return true end
+	if prop.pvsCluster then return pvs[prop.pvsCluster] end
+	local clusters = prop.pvsClusters
+	if not clusters then return true end
+
+	-- The same PVS is used every frame until the walker's view cluster changes.
+	if prop.checkedPVS ~= pvs then
+		prop.checkedPVS, prop.pvsVisible = pvs, false
+		for i = 1, #clusters do
+			if pvs[clusters[i]] then
+				prop.pvsVisible = true
+				break
+			end
+		end
+	end
+	return prop.pvsVisible
+end
+
+-- Use the active render view: the player's actual eye may be outside the miniature.
+-- Unknown projection modes fail open, including off-center and orthographic cameras.
+local function viewFrustum( mini )
+	-- Water reflections/refractions draw the miniature under a nested cam.Start3D.
+	-- GetViewSetup still describes the main view, so its planes are unsafe here.
+	if PocketMap.Water and PocketMap.Water.pass then return nil end
+	if render.GetRenderTarget and render.GetRenderTarget() then return nil end
+	local view = render.GetViewSetup()
+	if not view or not view.origin or not view.angles or view.ortho or view.offcenter or view.subrect then return nil end
+	-- Third-person and alternate camera hooks can render a different viewpoint.
+	if EyePos():DistToSqr( view.origin ) > 1 then return nil end
+	local eyeAngles = EyeAngles()
+	if eyeAngles:Forward():Dot( view.angles:Forward() ) < 0.999
+		or eyeAngles:Up():Dot( view.angles:Up() ) < 0.999 then return nil end
+	local fov, width, height = view.fov, view.width, view.height
+	if not fov or fov <= 1 or fov * 0.5 + FRUSTUM_FOV_PAD >= 90
+		or not width or not height or width <= 0 or height <= 0 then return nil end
+
+	local aspect = width / height
+	-- Some Source views provide the horizontal FOV for a 4:3 reference viewport.
+	-- Widen for other aspect ratios so either FOV convention is safe.
+	local halfWidth = math.tan( math.rad( fov * 0.5 + FRUSTUM_FOV_PAD ) ) * math.max( 1, aspect / ( 4 / 3 ) )
+	if view.aspect and view.aspect > 0 then aspect = math.min( aspect, view.aspect ) end
+	local halfHeight = halfWidth / aspect
+	-- Transform the camera once into the block. Prop sphere centers already use block space.
+	local angles = mini.ent:WorldToLocalAngles( view.angles )
+	return {
+		origin = mini.ent:WorldToLocal( view.origin ),
+		forward = angles:Forward(), right = angles:Right(), up = angles:Up(),
+		halfWidth = halfWidth, halfHeight = halfHeight,
+		widthRadius = math.sqrt( 1 + halfWidth * halfWidth ),
+		heightRadius = math.sqrt( 1 + halfHeight * halfHeight ),
+	}
+end
+
+local function visibleInFrustum( prop, frustum )
+	if not frustum or not prop.lcenter or not prop.sphereRadius then return true end
+	local delta = prop.lcenter - frustum.origin
+	local depth = delta:Dot( frustum.forward )
+	local radius = prop.sphereRadius
+	if depth + radius < 0 then return false end
+	if math.abs( delta:Dot( frustum.right ) ) > depth * frustum.halfWidth + radius * frustum.widthRadius then return false end
+	if math.abs( delta:Dot( frustum.up ) ) > depth * frustum.halfHeight + radius * frustum.heightRadius then return false end
+	return true
+end
+
+local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum )
 	local parts = group.meshes
 	if parts and not hasHalf( parts, translucent ) then return 0 end
 	if not parts and translucent and group.entTranslucent == false then return 0 end
 
 	local flags = DRAW_FLAGS
-	if not parts then
-		flags = prepareEntityGroup( entity, group, translucent )
-		if not flags then return 0 end
-		state.scale, state.skin = nil, nil
-	end
+	local prepared = parts ~= nil
 
 	local matrix, scaleVec = mini.propMatrix, mini.propScaleVec
 	local props = group.props
+	local drawn = 0
 
 	for i = 1, #props do
 		local p = props[i]
-		if p.stamp ~= stamp then
-			p.wpos, p.wang = LocalToWorld( p.lpos, p.langles, entPos, entAng )
-			p.stamp = stamp
-		end
+		if visibleInPVS( p, pvs ) and visibleInFrustum( p, frustum ) then
+			-- Skip expensive model and material setup when the entire group is culled.
+			if not prepared then
+				flags = prepareEntityGroup( entity, group, translucent )
+				if not flags then return 0 end
+				state.scale, state.skin = nil, nil
+				prepared = true
+			end
+			if p.stamp ~= stamp then
+				p.wpos, p.wang = LocalToWorld( p.lpos, p.langles, entPos, entAng )
+				p.stamp = stamp
+			end
 
-		setModelLight( state, p.light )
+			drawn = drawn + 1
+			setModelLight( state, p.light )
 
-		if parts then
-			scaleVec:SetUnpacked( p.lscale, p.lscale, p.lscale )
-			matrix:Identity()
-			matrix:SetTranslation( p.wpos )
-			matrix:SetAngles( p.wang )
-			matrix:SetScale( scaleVec )
+			if parts then
+				scaleVec:SetUnpacked( p.lscale, p.lscale, p.lscale )
+				matrix:Identity()
+				matrix:SetTranslation( p.wpos )
+				matrix:SetAngles( p.wang )
+				matrix:SetScale( scaleVec )
 
-			cam.PushModelMatrix( matrix )
-			drawParts( parts, translucent )
-			cam.PopModelMatrix()
-		else
-			drawEntityProp( entity, state, group, p.lscale, p.skin, p.wpos, p.wang, flags )
+				cam.PushModelMatrix( matrix )
+				drawParts( parts, translucent )
+				cam.PopModelMatrix()
+			else
+				drawEntityProp( entity, state, group, p.lscale, p.skin, p.wpos, p.wang, flags )
+			end
 		end
 	end
 
-	return #props
+	return drawn
 end
 
 local function drawPass( mini, translucent )
@@ -412,12 +563,36 @@ local function drawPass( mini, translucent )
 	local stamp, entPos, entAng = updateStamp( mini )
 	local state = {}
 	local drawn = 0
+	local walk = PocketMap.Walk and PocketMap.Walk.session
+	local pvs
+	local frustum = viewFrustum( mini )
+	if frustum and walk and walk.mini == mini and mini.bsp and mini.scale and mini.scale > 0 and mini:EyeInside() then
+		local height = not walk.noclip and bit.band( walk.move.buttons, IN_DUCK ) ~= 0 and 28 or 64
+		local origin = walk.move.origin + Vector( 0, 0, height )
+		local camera = ( origin - mini.mapCenter ) * mini.scale + mini.boxCenter
+		local tolerance = mini.scale * 4
+		-- The walker's PVS only represents their own viewpoint. Other cameras
+		-- (third person, mirrors, nested views) must draw all uncertain props.
+		if frustum.origin:DistToSqr( camera ) <= tolerance * tolerance then
+			local eye = ( frustum.origin - mini.boxCenter ) / mini.scale + mini.mapCenter
+			local bsp = mini.bsp
+			local cluster = bsp:ClusterFromPoint( eye )
+			local vis = cluster and cluster >= 0 and bsp:GetVisibility()
+			if vis and vis.VisData and vis.VisData[cluster] and not bsp:IsVisibilityCorrupted() then
+				if mini.propPVSCluster ~= cluster or mini.propPVSBSP ~= bsp then
+					mini.propPVSCluster, mini.propPVSBSP = cluster, bsp
+					mini.propPVS = bsp:PVSForOrigin( eye )
+				end
+				pvs = mini.propPVS
+			end
+		end
+	end
 
 	render.SuppressEngineLighting( true )
 	if translucent then render.OverrideDepthEnable( true, false ) end
 
 	for _, group in ipairs( mini.propGroups ) do
-		if not group.sky then drawn = drawn + drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng ) end
+		if not group.sky then drawn = drawn + drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum ) end
 	end
 
 	if translucent then render.OverrideDepthEnable( true, true ) end

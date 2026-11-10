@@ -27,6 +27,9 @@ local cvPropMeshes = CreateClientConVar( "pocketmap_propmeshes", "1", true, fals
 local SLOW_MATERIAL_SECONDS = 0.5
 local MATERIAL_FRAME_SECONDS = 0.1
 local FACES_PER_YIELD = 10
+-- Larger world batches cut draw calls; MeshBuilder splits at its vertex limit.
+-- Keep the 3D skybox's smaller batches for its existing draw path.
+local WORLD_SLICES_PER_MESH = 4
 local LDR_LIGHTING_LUMP, HDR_LIGHTING_LUMP, HDR_FACES_LUMP = 8, 53, 58
 local MORE = "more"
 
@@ -190,11 +193,23 @@ local function buildMaterialGroups( mini, job, groups, order, out, isWorld, prog
 		end
 
 		job.addOptions.material = material
-		for first = 1, #list, PocketMap.Faces.SLICE_SIZE do
+		local sliceSize = PocketMap.Faces.SLICE_SIZE
+		local facesPerMesh = isWorld and sliceSize * WORLD_SLICES_PER_MESH or sliceSize
+		for first = 1, #list, facesPerMesh do
 			mini:SetStatus( "Building " .. key, 0.15 + 0.45 * progress.done / job.slicesTotal )
-			out[#out + 1] = buildSlice( list, first, math.min( first + PocketMap.Faces.SLICE_SIZE - 1, #list ), job.addOptions )
+			local last = math.min( first + facesPerMesh - 1, #list )
+			local object = buildSlice( list, first, last, job.addOptions )
+			out[#out + 1] = object
+			if isWorld then
+				-- Keep the draw lists on the owning objects array so they go away when the miniature is destroyed.
+				for _, part in ipairs( object:GetMeshes() ) do
+					local drawList = part.translucent and out.translucentMeshes or out.opaqueMeshes
+					drawList[#drawList + 1] = part
+				end
+			end
 
-			progress.done = progress.done + 1
+			-- Faces.Sort counts the original slices, including the smaller skybox batches.
+			progress.done = progress.done + math.ceil( ( last - first + 1 ) / sliceSize )
 			coroutine.yield()
 		end
 		groups[key] = nil
@@ -203,6 +218,8 @@ end
 
 local function buildWorldMeshes( mini, job )
 	local progress = { done = 0 }
+	mini.objects.opaqueMeshes = {}
+	mini.objects.translucentMeshes = {}
 
 	buildMaterialGroups( mini, job, job.groups, job.order, mini.objects, true, progress )
 	if mini.lightmapTexture then buildMaterialGroups( mini, job, job.skyGroups, job.skyOrder, mini.skyObjects, false, progress ) end

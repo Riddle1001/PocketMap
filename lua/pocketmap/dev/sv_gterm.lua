@@ -18,7 +18,7 @@ net.Receive(CHANNEL, function(_, ply)
 	print("[PocketMap client #" .. id .. " " .. ply:Nick() .. "] " .. (ok and "OK: " or "ERROR: ") .. result)
 end)
 
-function GTerm.Run(code, ply)
+function GTerm.Run(code, ply, sourceName)
 	ply = ply or player.GetAll()[1]
 	if not IsValid(ply) then print("[PocketMap GTerm] No connected player") return end
 	if type(code) ~= "string" then print("[PocketMap GTerm] Expected Lua source") return end
@@ -29,7 +29,7 @@ function GTerm.Run(code, ply)
 	local script = string.format([[
 		local source = PocketMap_GTerm_Buffers[%d]
 		PocketMap_GTerm_Buffers[%d] = nil
-		local compiled = CompileString(source, "PocketMap GTerm client", false)
+		local compiled = CompileString(source, %q, false)
 		local ok, result
 		if type(compiled) == "function" then
 			ok, result = pcall(compiled)
@@ -41,7 +41,7 @@ function GTerm.Run(code, ply)
 		net.WriteBool(ok)
 		net.WriteString(tostring(result))
 		net.SendToServer()
-	]], id, id, CHANNEL, id)
+	]], id, id, sourceName or "PocketMap GTerm client", CHANNEL, id)
 	-- Newly registered network strings need a tick to reach connected clients.
 	timer.Simple(0.5, function()
 		if not IsValid(ply) then return end
@@ -63,5 +63,8 @@ end
 function GTerm.RunFile(path, ply)
 	local source = file.Read(path, "LUA")
 	if not source then print("[PocketMap GTerm] Lua file not found: " .. tostring(path)) return end
-	return GTerm.Run(source, ply)
+	-- Preserve the file's real debug source so hot reload replaces callbacks
+	-- registered with debug.getinfo(..., "S").source rather than duplicating them.
+	local debugPath = "addons/pocketmap/lua/" .. path:gsub("\\", "/")
+	return GTerm.Run(source, ply, debugPath)
 end
