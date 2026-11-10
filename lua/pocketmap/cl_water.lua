@@ -13,6 +13,8 @@ local MAX_RENDERED_HEIGHTS = 4
 local RELEASE_AFTER_FRAMES = 60
 local FLAT_SIZE = 16
 local MAX_MESH_VERTS = 30000
+local PVS_BOUNDS_PAD = 8
+local PVS_MAX_LEAFS = 512
 local REFLECTION_TONE_SCALE = 0.25
 local ENGINE_REFLECTION, ENGINE_REFRACTION = "_rt_WaterReflection", "_rt_WaterRefraction"
 
@@ -346,6 +348,41 @@ local function levelHeight( face )
 	return math.floor( z + 0.5 )
 end
 
+---Water planes combine many faces, sometimes across distant parts of the map.
+---Their full bounds are conservative for PVS: they include every touching
+---leaf, so an unknown leaf or oversized query keeps the plane visible.
+local function preparePlanePVS( mini, plane )
+	if plane.pvsBSP == mini.bsp then return end
+	plane.pvsBSP, plane.pvsClusters = mini.bsp, nil
+	local bsp = mini.bsp
+	if not bsp or plane.mins.x > plane.maxs.x or plane.mins.y > plane.maxs.y or plane.mins.z > plane.maxs.z then return end
+	local leaves = bsp:AABBInLeafs( 0, plane.mins, plane.maxs, PVS_BOUNDS_PAD )
+	if #leaves == 0 or #leaves > PVS_MAX_LEAFS then return end
+
+	local clusters, seen = {}, {}
+	for _, leaf in ipairs( leaves ) do
+		local cluster = leaf.cluster
+		if cluster == nil or ( cluster < 0 and bit.band( leaf.contents or 0, CONTENTS_SOLID ) == 0 ) then return end
+		if cluster >= 0 and not seen[cluster] then
+			seen[cluster] = true
+			clusters[#clusters + 1] = cluster
+		end
+	end
+	if #clusters > 0 then plane.pvsClusters = clusters end
+end
+
+local function visibleInPVS( plane, pvs )
+	local clusters = plane.pvsClusters
+	if not pvs or not clusters then return true end
+	if plane.checkedPVS ~= pvs then
+		plane.checkedPVS, plane.pvsVisible = pvs, false
+		for i = 1, #clusters do
+			if pvs[clusters[i]] then plane.pvsVisible = true break end
+		end
+	end
+	return plane.pvsVisible
+end
+
 ---Runs inside the loader (it yields). Level faces become planes by height; faces that can't be planes are returned to be built normally.
 ---@param key string # the texture name of the faces
 ---@param material IMaterial
@@ -392,6 +429,7 @@ function Water.Build( mini, key, material, faces )
 			local rec = heightRecord( mini, z )
 			rec.planes[#rec.planes + 1] = plane
 			buildMeshes( plane, byHeight[z] )
+			preparePlanePVS( mini, plane )
 		else
 			table.Add( rest, byHeight[z] )
 		end
@@ -410,6 +448,7 @@ function Water.Build( mini, key, material, faces )
 	mini.waterLoose[#mini.waterLoose + 1] = loose
 	buildMeshes( loose, rest )
 	loose.bounds3D = true
+	preparePlanePVS( mini, loose )
 	return {}
 end
 
@@ -446,9 +485,11 @@ local function drawView()
 	return view.waterDrawView
 end
 
-local function drawPlanes( mini, planes, materials, currentMaterial, view )
+local function drawPlanes( mini, planes, materials, currentMaterial, view, pvs )
 	for _, plane in ipairs( planes ) do
-		if #plane.meshes > 0 then
+		-- Also handles water planes already loaded before a clientside hot reload.
+		if plane.pvsBSP ~= mini.bsp then preparePlanePVS( mini, plane ) end
+		if #plane.meshes > 0 and visibleInPVS( plane, pvs ) then
 			local visible = true
 			if view and ( not plane.loose or plane.bounds3D ) then
 				local mins, maxs = planeWorldBounds( mini, plane )
@@ -467,9 +508,9 @@ local function drawPlanes( mini, planes, materials, currentMaterial, view )
 	return currentMaterial
 end
 
-local function drawWater( mini, planes, loose, materials, view )
-	local currentMaterial = drawPlanes( mini, planes, materials, nil, view )
-	if loose then drawPlanes( mini, loose, materials, currentMaterial, view ) end
+local function drawWater( mini, planes, loose, materials, view, pvs )
+	local currentMaterial = drawPlanes( mini, planes, materials, nil, view, pvs )
+	if loose then drawPlanes( mini, loose, materials, currentMaterial, view, pvs ) end
 end
 
 ---Not drawn inside its own reflection and refraction. Restore shared material parameters even if a mesh fails to draw.
@@ -478,9 +519,12 @@ function Water.Draw( mini )
 	if Water.pass or not planes or ( #planes == 0 and ( not loose or #loose == 0 ) ) then return end
 
 	local view = drawView()
+	-- The opaque world was drawn immediately before water, using this same
+	-- view. Its PVS is valid only for the walker's camera inside the miniature.
+	local pvs = view and mini.worldPVSActive and ( PocketMap.PVSFreeze.Get( mini ) or mini.worldPVS )
 	local materials = {}
 	cam.PushModelMatrix( mini.matrix )
-	local ok, err = pcall( drawWater, mini, planes, loose, materials, view )
+	local ok, err = pcall( drawWater, mini, planes, loose, materials, view, pvs )
 	for material, saved in pairs( materials ) do unbind( material, saved ) end
 	cam.PopModelMatrix()
 	if not ok then error( err, 0 ) end
