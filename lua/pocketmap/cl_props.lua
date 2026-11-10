@@ -121,7 +121,7 @@ local function readEntityProps( mini, job )
 		local model = modelPathOf( entity )
 		local class = Entities.Class( entity )
 
-		if model and not class:find( "^trigger_" ) then
+		if model and class ~= "prop_door_rotating" and not class:find( "^trigger_" ) then
 			if isHiddenByMap( entity ) then
 				mini.hiddenEntities = mini.hiddenEntities + 1
 			else

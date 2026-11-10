@@ -76,6 +76,7 @@ local function drawContents( mini, options, pass )
 
 	if doOpaque then
 		for i = 1, #objects do objects[i]:DrawOpaque( matrix, options ) end
+		PocketMap.MapIO.Draw(mini, options, false)
 		Water.Draw( mini )
 
 		if not lite then
@@ -95,6 +96,7 @@ local function drawContents( mini, options, pass )
 		end
 
 		for i = 1, #objects do objects[i]:DrawTranslucent( matrix, options ) end
+		PocketMap.MapIO.Draw(mini, options, true)
 		render.OverrideDepthEnable( true, true )
 	end
 end

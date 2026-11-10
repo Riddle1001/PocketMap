@@ -129,6 +129,7 @@ local function allFaces( job )
 	for _, groups in ipairs( { job.groups, job.skyGroups } ) do
 		for _, list in pairs( groups ) do table.Add( faces, list ) end
 	end
+	for _, dynamic in pairs(job.dynamicFaces or {}) do table.Add(faces, dynamic) end
 	return faces
 end
 
@@ -234,6 +235,7 @@ function Loader.Run( mini )
 	PocketMap.Displacements.Build( mini, job, coroutine.yield )
 	loadMaterials( mini, job )
 	prepareLight( mini, job )
+	PocketMap.MapIO.BuildMeshes( mini, job )
 	buildWorldMeshes( mini, job )
 	PocketMap.Props.Collect( mini, job )
 	PocketMap.Detail.Build( mini, job )

@@ -97,6 +97,7 @@ function Mini:Destroy()
 	end
 
 	destroyAll( self.objects )
+	PocketMap.MapIO.Destroy(self)
 	destroyAll( self.skyObjects )
 	destroyAll( self.detailMeshes )
 	PocketMap.Water.Free( self )
