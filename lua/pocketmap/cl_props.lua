@@ -603,16 +603,19 @@ local function drawPass( mini, translucent )
 		-- The walker's PVS only represents their own viewpoint. Other cameras
 		-- (third person, mirrors, nested views) must draw all uncertain props.
 		if frustum.origin:DistToSqr( camera ) <= tolerance * tolerance then
-			local eye = ( frustum.origin - mini.boxCenter ) / mini.scale + mini.mapCenter
-			local bsp = mini.bsp
-			local cluster = bsp:ClusterFromPoint( eye )
-			local vis = cluster and cluster >= 0 and bsp:GetVisibility()
-			if vis and vis.VisData and vis.VisData[cluster] and not bsp:IsVisibilityCorrupted() then
-				if mini.propPVSCluster ~= cluster or mini.propPVSBSP ~= bsp then
-					mini.propPVSCluster, mini.propPVSBSP = cluster, bsp
-					mini.propPVS = bsp:PVSForOrigin( eye )
+			pvs = PocketMap.PVSFreeze.Get( mini )
+			if not pvs then
+				local eye = ( frustum.origin - mini.boxCenter ) / mini.scale + mini.mapCenter
+				local bsp = mini.bsp
+				local cluster = bsp:ClusterFromPoint( eye )
+				local vis = cluster and cluster >= 0 and bsp:GetVisibility()
+				if vis and vis.VisData and vis.VisData[cluster] and not bsp:IsVisibilityCorrupted() then
+					if mini.propPVSCluster ~= cluster or mini.propPVSBSP ~= bsp then
+						mini.propPVSCluster, mini.propPVSBSP = cluster, bsp
+						mini.propPVS = bsp:PVSForOrigin( eye )
+					end
+					pvs = mini.propPVS
 				end
-				pvs = mini.propPVS
 			end
 		end
 	end

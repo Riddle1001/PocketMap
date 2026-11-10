@@ -581,6 +581,8 @@ end
 local function drawPVS(mini, walk, view)
 	if not walk or walk.mini ~= mini or not walk.io or not view or not mini.scale or mini.scale <= 0
 		or not mini.bsp or not mini:EyeInside() then return end
+	local frozen = PocketMap.PVSFreeze.Get(mini)
+	if frozen then return frozen end
 	local bsp = mini.bsp
 	local eye = (mini.ent:WorldToLocal(view.origin) - mini.boxCenter) / mini.scale + mini.mapCenter
 	local cluster = bsp:ClusterFromPoint(eye)

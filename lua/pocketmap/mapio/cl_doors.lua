@@ -166,6 +166,8 @@ local function doorPVS(mini, view)
 	if not view or not mini.bsp or not mini.scale or mini.scale <= 0 or not mini:EyeInside() then return end
 	local walk = PocketMap.Walk and PocketMap.Walk.session
 	if not walk or walk.mini ~= mini then return end
+	local frozen = PocketMap.PVSFreeze.Get(mini)
+	if frozen then return frozen end
 	-- Match visibility to the rendered eye, including view offsets and camera motion.
 	local eye = (view.origin - mini.boxCenter) / mini.scale + mini.mapCenter
 	local bsp = mini.bsp

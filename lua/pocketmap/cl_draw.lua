@@ -104,6 +104,8 @@ end
 -- source map. Invalid VIS, sky views, or unknown cameras fail open.
 local function worldPVS( mini, view )
 	if not view or not mini.bsp or not mini:EyeInside() then return nil end
+	local frozen = PocketMap.PVSFreeze.Get( mini )
+	if frozen then return frozen end
 	local bsp = mini.bsp
 	local eye = ( view.origin - mini.boxCenter ) / mini.scale + mini.mapCenter
 	local cluster = bsp:ClusterFromPoint( eye )

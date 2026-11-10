@@ -29,6 +29,7 @@ local CLIENT_FILES = {
 	"pocketmap/cl_hologram.lua",
 	"pocketmap/cl_water.lua",
 	"pocketmap/cl_miniature.lua",
+	"pocketmap/cl_pvs_freeze.lua",
 	"pocketmap/cl_atlas.lua",
 	"pocketmap/cl_propmesh.lua",
 	"pocketmap/cl_proplight.lua",
