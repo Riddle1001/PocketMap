@@ -20,6 +20,7 @@ local CLIENT_FILES = {
 	"pocketmap/mapio/cl_core.lua",
 	"pocketmap/mapio/cl_teleport.lua",
 	"pocketmap/mapio/cl_doors.lua",
+	"pocketmap/mapio/cl_buttons.lua",
 	"pocketmap/cl_pak.lua",
 	"pocketmap/cl_materials.lua",
 	"pocketmap/cl_lightstyles.lua",
