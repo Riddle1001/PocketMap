@@ -124,6 +124,8 @@ function IO.OfClass(world, class)
 end
 
 function IO.NewSession(mini)
+	-- A miniature may predate a Lua auto-refresh of the Map I/O loader.
+	if mini.bsp and (not mini.mapIO or not mini.mapIO.solids) then IO.Build(mini, mini.bsp:GetEntities()) end
 	return { world = mini.mapIO, touching = {}, time = 0, queue = {}, counts = {}, records = {} }
 end
 
@@ -219,7 +221,7 @@ end
 -- The same local BSP coordinates as Session:TraceHull, without spawning actual entities.
 function IO.Trace(session, start, finish, mins, maxs, out)
 	local state = session.io
-	if not state then return end
+	if not state or not state.world or not state.world.solids then return end
 	for _, record in ipairs(state.world.solids) do
 		local handler = IO.classes[record.class]
 		if handler and handler.solid and (handler.solid == true or handler.solid(state, record)) then

@@ -66,6 +66,21 @@ local function advance(session, ticks)
 end
 
 local tests = {}
+function tests.session_reload()
+	local mini = { bsp = {
+		GetBModels = function() return models end,
+		GetEntities = function() return { { classname = "func_door", model = "*2" } } end,
+	} }
+	local state = IO.NewSession(mini)
+	assert(state.world and #state.world.solids == 1, "stale miniature did not rebuild Map I/O")
+	mini.mapIO = {}
+	assert(#IO.NewSession(mini).world.solids == 1, "partial Map I/O world did not rebuild")
+	local hit = { Fraction = 1 }
+	IO.Trace({ io = { } }, Vector(), Vector(100, 0, 0), Vector(), Vector(), hit)
+	assert(hit.Fraction == 1, "missing world modified collision result")
+	print("PASS session reload: stale miniature, missing world trace")
+end
+
 function tests.teleport()
 	local session, state = world({
 		{ classname = "trigger_teleport", origin = Vector(), model = "*1", target = "Exit", OnTrigger = table.concat({ "relay", "Enable", "", "0", "-1" }, string.char(27)) },
