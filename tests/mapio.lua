@@ -81,6 +81,21 @@ function tests.session_reload()
 	print("PASS session reload: stale miniature, missing world trace")
 end
 
+function tests.late_registration()
+	local entities = { { classname = "func_late_use", model = "*1" } }
+	local mini = { bsp = {
+		GetBModels = function() return models end,
+		GetEntities = function() return entities end,
+	} }
+	IO.Build(mini, entities)
+	assert(#mini.mapIO.solids == 0 and #mini.mapIO.useTargets == 0, "late class unexpectedly registered")
+	IO.Register("func_late_use", { solid = true, use = function() end })
+	local state = IO.NewSession(mini)
+	assert(#state.world.solids == 1 and #state.world.useTargets == 1, "late handler did not rebuild interaction targets")
+	assert(state.world.registrationVersion == IO.registrationVersion, "registry revision was not stored")
+	print("PASS late registration: existing miniature rebuilt for added handlers")
+end
+
 function tests.teleport()
 	local session, state = world({
 		{ classname = "trigger_teleport", origin = Vector(), model = "*1", target = "Exit", OnTrigger = table.concat({ "relay", "Enable", "", "0", "-1" }, string.char(27)) },

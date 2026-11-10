@@ -8,6 +8,7 @@ IO.classes = {}
 IO.steps = {}
 IO.dynamic = {}
 IO.draws = {}
+IO.registrationVersion = 0
 
 function IO.DynamicClass(class)
 	IO.dynamic[class] = true
@@ -43,6 +44,7 @@ end
 
 function IO.Register(class, handlers)
 	IO.classes[class] = handlers
+	IO.registrationVersion = IO.registrationVersion + 1
 end
 
 function IO.OnStep(callback)
@@ -91,7 +93,7 @@ local function outputs(entity)
 end
 
 function IO.Build(mini, entities)
-	local world = { entities = {}, names = {}, byClass = {}, byEntity = {}, dynamicModels = {}, solids = {}, useTargets = {} }
+	local world = { entities = {}, names = {}, byClass = {}, byEntity = {}, dynamicModels = {}, solids = {}, useTargets = {}, registrationVersion = IO.registrationVersion }
 	local models = mini.bsp:GetBModels()
 	for _, entity in pairs(entities) do
 		local model = IO.Value(entity, "model")
@@ -125,7 +127,9 @@ end
 
 function IO.NewSession(mini)
 	-- A miniature may predate a Lua auto-refresh of the Map I/O loader.
-	if mini.bsp and (not mini.mapIO or not mini.mapIO.solids) then IO.Build(mini, mini.bsp:GetEntities()) end
+	if mini.bsp and (not mini.mapIO or not mini.mapIO.solids or mini.mapIO.registrationVersion ~= IO.registrationVersion) then
+		IO.Build(mini, mini.bsp:GetEntities())
+	end
 	return { world = mini.mapIO, touching = {}, time = 0, queue = {}, counts = {}, records = {} }
 end
 
