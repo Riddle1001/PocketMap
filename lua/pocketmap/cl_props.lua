@@ -285,7 +285,7 @@ local function newPlacer( mini, job, light )
 	local scale = job.scale
 
 	return {
-		inBlock = function( prop, mins, maxs )
+		inBlock = function( prop, mins, maxs, model )
 			local pvsCluster, pvsClusters = propClusters( job.bsp, prop, mins, maxs )
 			local sphereCenter, sphereRadius = propSphere( mini, prop, mins, maxs, scale )
 			return {
@@ -293,15 +293,15 @@ local function newPlacer( mini, job, light )
 				langles = prop.Angles,
 				skin = prop.Skin or 0,
 				lscale = ( prop.UniformScale or 1 ) * scale,
-				light = light:Of( prop ),
+				light = light:Of( prop, model ),
 				pvsCluster = pvsCluster, pvsClusters = pvsClusters,
 				lcenter = sphereCenter, sphereRadius = sphereRadius,
 			}
 		end,
 
 		---A prop of the sky room stays where it is in the sky room: it moves with the skybox.
-		inSkyRoom = function( prop )
-			return { origin = prop.Origin, angles = prop.Angles, skin = prop.Skin or 0, uscale = prop.UniformScale or 1, light = light:Of( prop ) }
+		inSkyRoom = function( prop, model )
+			return { origin = prop.Origin, angles = prop.Angles, skin = prop.Skin or 0, uscale = prop.UniformScale or 1, light = light:Of( prop, model ) }
 		end,
 	}
 end
@@ -316,13 +316,14 @@ local function placeModel( mini, placer, props, path, anim, bakeMeshes )
 	local posed = not anim and needsSequencePose( mini, props, path )
 	local mins, maxs = modelBounds( mini, path )
 
-	for _, prop in ipairs( props ) do
+	for index, prop in ipairs( props ) do
 		if prop.Sky then
-			skyKept[#skyKept + 1] = placer.inSkyRoom( prop )
+			skyKept[#skyKept + 1] = placer.inSkyRoom( prop, path )
 		else
 			local list = ( posed and prop.EntityProp ) and keptPosed or kept
-			list[#list + 1] = placer.inBlock( prop, ( anim or ( posed and prop.EntityProp ) ) and nil or mins, maxs )
+			list[#list + 1] = placer.inBlock( prop, ( anim or ( posed and prop.EntityProp ) ) and nil or mins, maxs, path )
 		end
+		if index % 8 == 0 then coroutine.yield() end
 	end
 
 	if #keptPosed > 0 then addGroup( mini, { model = path, anim = 0, props = keptPosed } ) end
@@ -382,7 +383,13 @@ end
 
 -- Drawing -------------------------------------------------------------------------------------------------------------
 
-local function setModelLight( state, light )
+local function setModelLight( state, light, transform )
+	local rendered = PocketMap.PropLight.ForRender( light, transform )
+	if state.direct ~= rendered.direct then
+		render.SetLocalModelLights( rendered.direct )
+		state.direct = rendered.direct
+	end
+	light = rendered.cube
 	if light == state.light then return end
 	-- Many static props have separately allocated but identical ambient cubes.
 	-- Avoid six render-state changes when the already bound colors match.
@@ -718,7 +725,7 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 			end
 
 			drawn = drawn + 1
-			if not shadowFlags then setModelLight( state, p.light ) end
+			if not shadowFlags then setModelLight( state, p.light, mini.propLightTransform ) end
 
 			if parts then
 				-- The block's transform is unchanged on most frames. Reuse each
@@ -790,6 +797,7 @@ local function drawPass( mini, translucent )
 
 	local entity = propEntity( mini )
 	local stamp, entPos, entAng = updateStamp( mini )
+	mini.propLightTransform = PocketMap.PropLight.Transform( mini.matrix, mini.propLightTransform )
 	local state = {}
 	local drawn = 0
 	local context
@@ -810,6 +818,7 @@ local function drawPass( mini, translucent )
 	end
 
 	if translucent then render.OverrideDepthEnable( true, true ) end
+	render.SetLocalModelLights()
 	render.SetColorModulation( 1, 1, 1 )
 	render.SuppressEngineLighting( false )
 	traceNextProp( mini, occlusion )
@@ -888,7 +897,7 @@ local function drawSkyGroup( mini, group, translucent, skyMatrix, state )
 	end
 
 	for _, p in ipairs( group.props ) do
-		setModelLight( state, p.light )
+		setModelLight( state, p.light, mini.skyLightTransform )
 		local matrix = skyPropMatrix( mini, skyMatrix, p )
 
 		if parts then
@@ -908,6 +917,7 @@ local function drawSkyPass( mini, skyMatrix, translucent )
 	if #selected == 0 then return end
 
 	local state = {}
+	mini.skyLightTransform = PocketMap.PropLight.Transform( skyMatrix, mini.skyLightTransform )
 	if translucent then render.OverrideDepthEnable( true, false ) end
 	render.SuppressEngineLighting( true )
 
@@ -916,6 +926,7 @@ local function drawSkyPass( mini, skyMatrix, translucent )
 	end
 
 	if translucent then render.OverrideDepthEnable( true, true ) end
+	render.SetLocalModelLights()
 	render.SetColorModulation( 1, 1, 1 )
 	render.SuppressEngineLighting( false )
 end
