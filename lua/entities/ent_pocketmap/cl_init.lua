@@ -137,8 +137,8 @@ local function isWaterReflectionPass()
 	return target ~= nil and string.find( target:GetName(), WATER_TARGET_PATTERN ) ~= nil
 end
 
-local function shouldSkipDraw( flags )
-	return isShadowDepthPass( flags ) or isWaterReflectionPass()
+local function shouldSkipDraw()
+	return isWaterReflectionPass()
 end
 
 local function drawAsGlass( ent, alpha )
@@ -152,24 +152,32 @@ local function isInHintRange( block )
 end
 
 function ENT:Draw( flags )
+	if isShadowDepthPass( flags ) then
+		if PocketMap.Flashlight then PocketMap.Flashlight.DrawDepth(self.Miniature, flags) end
+		return
+	end
 	if halo.RenderedEntity() == self then
 		self:DrawModel()
 		return
 	end
 
-	if shouldSkipDraw( flags ) then return end
+	if shouldSkipDraw() then return end
 
 	local mini = self.Miniature
 	if mini and mini.state ~= "error" then mini:Draw( "opaque" ) end
 end
 
 function ENT:DrawTranslucent( flags )
+	if isShadowDepthPass( flags ) then
+		if PocketMap.Flashlight then PocketMap.Flashlight.DrawDepth(self.Miniature, flags) end
+		return
+	end
 	if halo.RenderedEntity() == self then
 		self:Draw( flags )
 		return
 	end
 
-	if shouldSkipDraw( flags ) then return end
+	if shouldSkipDraw() then return end
 
 	local mini = self.Miniature
 	if mini and not self:HasMiniatureFailed() then

@@ -950,6 +950,24 @@ function IO.Draw(mini, options, translucent)
 	for _, callback in ipairs(IO.draws) do callback(mini, state, translucent) end
 end
 
+function IO.DrawDepth(mini, options, flags)
+	local walk = PocketMap.Walk and PocketMap.Walk.session
+	local state = walk and walk.mini == mini and walk.io
+	bindMeshRecords(mini, state and state.world or mini.mapIO)
+	for _, item in ipairs(passMeshes(mini, false)) do
+		local record = item.record
+		local origin, angles = IO.Position(state, record), IO.Rotation(state, record)
+		local matrix = item.shadowMatrix or Matrix()
+		item.shadowMatrix = matrix
+		matrix:Set(mini.matrix)
+		matrix:Translate(origin)
+		matrix:Rotate(angles)
+		matrix:Mul(item.inverse)
+		item.mesh:DrawOpaque(matrix, options)
+	end
+	for _, callback in ipairs(IO.draws) do callback(mini, state, false, flags) end
+end
+
 function IO.Destroy(mini)
 	for _, item in ipairs(mini.dynamicMeshes or {}) do item.mesh:Destroy() end
 	mini.dynamicMeshes = nil

@@ -40,6 +40,7 @@ local CLIENT_FILES = {
 	"pocketmap/cl_displacements.lua",
 	"pocketmap/cl_sky.lua",
 	"pocketmap/cl_loader.lua",
+	"pocketmap/cl_flashlight.lua",
 	"pocketmap/cl_draw.lua",
 	"pocketmap/cl_lightanim.lua",
 	"pocketmap/cl_maplist.lua",
@@ -48,6 +49,7 @@ local CLIENT_FILES = {
 	"pocketmap/cl_gamemove.lua",
 	"pocketmap/cl_footsteps.lua",
 	"pocketmap/cl_walk.lua",
+	"pocketmap/cl_compare.lua",
 	"pocketmap/cl_walkers.lua",
 }
 
@@ -59,6 +61,8 @@ if SERVER then
 	util.AddNetworkString( "PocketMap_Respawn" )
 
 	for _, path in ipairs( CLIENT_FILES ) do AddCSLuaFile( path ) end
+	include("pocketmap/sv_compare.lua")
+	include("pocketmap/sv_flashlight.lua")
 end
 
 if CLIENT then

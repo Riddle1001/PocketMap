@@ -74,6 +74,10 @@ You start at a random player spawn of the map. Your noclip key (default V) or `p
 
 Console commands: `pocketmap_walk` and `pocketmap_noclip`.
 
+While walking, the flashlight uses Source's projected light and shadow rendering, scaled to the miniature with the regular flashlight settings and toggle.
+
+For visual debugging, `pocketmap_compare` switches between a walking PocketMap and the actual map at the same eye position and viewing angle. Both maps must match. Run it again to return; the native comparison uses noclip to hold the viewpoint. This requires admin access or a session grant from the server (`ply.PocketMapCanCompare = true`).
+
 ## License
 
 [CC0 1.0](LICENSE): use the code however you like, in any project, with no credit or notice required. If you find it useful and we meet some day, you can buy me a beer, but that's not required. (`cl_maplist.lua` is based on Facepunch's MIT-licensed `getmaplist.lua` and keeps its own notice.)

@@ -410,9 +410,10 @@ local function drawParts( parts, translucent, state )
 	for i = 1, #parts do
 		local part = parts[i]
 		if part.translucent == translucent then
-			if state.material ~= part.material then
-				render.SetMaterial( part.material )
-				state.material = part.material
+			local material = state.depth and PocketMap.Flashlight.DepthMaterial(part.material) or part.material
+			if state.material ~= material then
+				render.SetMaterial( material )
+				state.material = material
 			end
 			part.mesh:Draw()
 		end
@@ -674,7 +675,7 @@ local function traceNextProp( mini, cache )
 	prop.occlusionCache, prop.occlusionGeneration = cache, cache.generation
 end
 
-local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse, occlusion )
+local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse, occlusion, shadowFlags )
 	local parts = group.meshes
 	if parts and not hasHalf( parts, translucent ) then return 0 end
 	if not parts and translucent and group.entTranslucent == false then return 0 end
@@ -707,6 +708,7 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 			if not prepared then
 				flags = prepareEntityGroup( entity, group, translucent )
 				if not flags then return 0 end
+				flags = shadowFlags or flags
 				state.scale, state.skin = nil, nil
 				prepared = true
 			end
@@ -716,7 +718,7 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 			end
 
 			drawn = drawn + 1
-			setModelLight( state, p.light )
+			if not shadowFlags then setModelLight( state, p.light ) end
 
 			if parts then
 				-- The block's transform is unchanged on most frames. Reuse each
@@ -819,6 +821,19 @@ end
 function Props.Draw( mini, pass )
 	if pass ~= "translucent" then drawPass( mini, false ) end
 	if pass ~= "opaque" then drawPass( mini, true ) end
+end
+
+-- Use every opaque caster, independently of the viewer's visibility caches.
+function Props.DrawDepth( mini, flags )
+	if #mini.propGroups == 0 then return end
+	local entity = propEntity( mini )
+	local stamp, pos, ang = updateStamp( mini )
+	local state = { depth = true }
+	for _, group in ipairs( mini.propGroups ) do
+		if not group.sky then
+			drawGroup( mini, group, false, entity, state, stamp, pos, ang, nil, nil, nil, false, nil, flags )
+		end
+	end
 end
 
 -- The props of the 3D skybox room are drawn with the skybox: each is moved with the matrix of the sky room ------------

@@ -1,5 +1,5 @@
 -- Drawing a loaded map. The engine draws a block in two passes (opaque, translucent), and the views that use the stencil (the
--- sky behind the map, the 3D skybox, the flashlight) can't be split, so they are all drawn in the translucent call.
+-- sky behind the map and the 3D skybox) can't be split, so they are drawn in the translucent call.
 
 if not PocketMap.Mini then return end
 
@@ -9,31 +9,13 @@ local Sky = PocketMap.Sky
 local Detail = PocketMap.Detail
 local Props = PocketMap.Props
 
-local FLASHLIGHT_STRENGTH = 0.6
-local FLASHLIGHT_SIZE = 0.9
 local WORLD_FRUSTUM_FOV_PAD = 6
 local cvWorldFrustumCache = CreateClientConVar( "pocketmap_world_frustum_cache", "1", true, false,
 	"Reuse visible world meshes while the rendered view and miniature are unchanged" )
 local cvWaterSceneCull = CreateClientConVar( "pocketmap_water_scene_cull", "1", true, false,
 	"Cull world meshes outside the water reflection and refraction cameras" )
 
-local beamTexture
-
----The beam texture of the flashlight, the cookie the engine projects.
-local function getBeamTexture()
-	if beamTexture == nil then
-		local material = Material( "effects/flashlight001" )
-		beamTexture = not material:IsError() and material:GetTexture( "$basetexture" ) or false
-	end
-	return beamTexture or nil
-end
-
-local function activeFlashlightBeam()
-	if FLASHLIGHT_STRENGTH <= 0 or not LocalPlayer():FlashlightIsOn() then return nil end
-	return getBeamTexture()
-end
-
----Mark every pixel the map draws with 1, to limit the flashlight spot to those.
+---Mark the miniature's pixels for its sky and backdrop passes.
 local function beginStencil()
 	render.ClearStencil()
 	render.SetStencilEnable( true )
@@ -44,21 +26,6 @@ local function beginStencil()
 	render.SetStencilPassOperation( STENCIL_REPLACE )
 	render.SetStencilFailOperation( STENCIL_KEEP )
 	render.SetStencilZFailOperation( STENCIL_KEEP )
-end
-
----Multiplied in as dst * ( 1 + beam ): it brightens what is lit instead of adding white.
-local function drawFlashlightSpot( beam )
-	render.SetStencilCompareFunction( STENCIL_EQUAL )
-	render.SetStencilPassOperation( STENCIL_KEEP )
-
-	local size = ScrH() * FLASHLIGHT_SIZE
-	cam.Start2D()
-		render.OverrideBlend( true, BLEND_DST_COLOR, BLEND_ONE, BLENDFUNC_ADD )
-		render.SetColorModulation( FLASHLIGHT_STRENGTH, FLASHLIGHT_STRENGTH, FLASHLIGHT_STRENGTH )
-		render.DrawTextureToScreenRect( beam, ScrW() / 2 - size / 2, ScrH() / 2 - size / 2, size, size )
-		render.SetColorModulation( 1, 1, 1 )
-		render.OverrideBlend( false )
-	cam.End2D()
 end
 
 ---Without an atlas the map is drawn fullbright.
@@ -210,7 +177,7 @@ end
 local function drawWorld( mini, options, translucent )
 	local objects = mini.objects
 	local meshes = translucent and objects.translucentMeshes or objects.opaqueMeshes
-	local batched = meshes and options.lightmap and not options.lightOnly and not options.ignoreZ
+	local batched = meshes and ( options.lightmap or options.flashlight ) and not options.lightOnly and not options.ignoreZ
 	if batched and #meshes == 0 then return end
 	if not batched and #objects == 0 then return end
 
@@ -224,7 +191,7 @@ local function drawWorld( mini, options, translucent )
 		local visible = worldFrustumParts( mini, meshes, pvs, translucent, view )
 		local candidates = visible or worldPVSCandidates( mini, meshes, pvs, translucent )
 		if translucent then render.OverrideDepthEnable( true, false ) end
-		render.SetLightmapTexture( options.lightmap )
+		if options.lightmap then render.SetLightmapTexture( options.lightmap ) end
 		local lastMaterial
 		local drawn = 0
 		for i = 1, #candidates do
@@ -303,6 +270,16 @@ function Mini:DrawScene( options )
 	render.OverrideDepthEnable( false )
 end
 
+local flashlightOptions = { light = false, fullbright = false, flashlight = true }
+local function drawFlashlights( mini )
+	if Water.pass then return end
+	render.RenderFlashlights(function()
+		drawWorld( mini, flashlightOptions, false )
+		PocketMap.MapIO.Draw(mini, PocketMap.Materials.DrawOptions(flashlightOptions, mini.scale), false)
+		Props.Draw( mini, "opaque" )
+	end)
+end
+
 ---@param pass "opaque"|"translucent"|nil
 function Mini:Draw( pass )
 	if self.state == "removed" or not self.scaleVec then return end
@@ -314,11 +291,10 @@ function Mini:Draw( pass )
 	if self.waterPlanes and #self.waterPlanes > 0 and onScreen then Water.Calibrate() end
 
 	local options = drawOptions( self )
-	local flashlight = activeFlashlightBeam()
 	local sky = #self.skyObjects > 0 and onScreen and self:EyeInside()
 	local backdrop = self.skyBackdrop ~= nil and onScreen
 
-	local usesStencil = flashlight or sky or backdrop
+	local usesStencil = sky or backdrop
 	if usesStencil and pass == "opaque" then return end
 	if usesStencil then
 		pass = nil
@@ -330,8 +306,8 @@ function Mini:Draw( pass )
 
 	render.OverrideDepthEnable( true, true )
 	drawContents( self, options, pass )
+	if pass ~= "translucent" then drawFlashlights( self ) end
 	render.OverrideDepthEnable( false )
 
-	if flashlight then drawFlashlightSpot( flashlight ) end
 	if usesStencil then render.SetStencilEnable( false ) end
 end

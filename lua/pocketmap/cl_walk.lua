@@ -236,6 +236,7 @@ local function sendWalkStateIfDue(session)
 end
 
 function Walk.Leave()
+	if PocketMap.Flashlight then PocketMap.Flashlight.Stop() end
 	local session = Walk.session
 	Walk.session = nil
 	if PocketMap.GamemodeMovement then PocketMap.GamemodeMovement.Reset() end

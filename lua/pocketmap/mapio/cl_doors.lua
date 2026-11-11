@@ -380,7 +380,7 @@ local function doorCandidates(mini, state, entries, pvs)
 	return candidates
 end
 
-IO.OnDraw(function(mini, state, translucent)
+IO.OnDraw(function(mini, state, translucent, shadowFlags)
 	if translucent or not mini.mapIO or not ClientsideModel then return end
 	local records = IO.OfClass(mini.mapIO, "prop_door_rotating")
 	if #records == 0 then return end
@@ -389,11 +389,11 @@ IO.OnDraw(function(mini, state, translucent)
 		mini.mapIODoorProp:SetNoDraw(true)
 	end
 	local model = mini.mapIODoorProp
-	local frustum = doorFrustum(mini)
-	local pvs = doorPVS(mini, frustum)
+	local frustum = not shadowFlags and doorFrustum(mini) or nil
+	local pvs = not shadowFlags and doorPVS(mini, frustum) or nil
 	local entries = doorEntries(mini, state, records, model)
 	local candidates = doorCandidates(mini, state, entries, pvs)
-	local occlusion = updateDoorOcclusion(mini, state, entries, candidates, pvs, frustum)
+	local occlusion = not shadowFlags and updateDoorOcclusion(mini, state, entries, candidates, pvs, frustum) or nil
 	local lastPath, lastScale, lastSkin = mini.mapIODoorLastPath, mini.mapIODoorLastScale, mini.mapIODoorLastSkin
 	local stamp = mini.mapIODrawStamp
 	local entPos, entAng = mini.ent:GetPos(), mini.ent:GetAngles()
@@ -422,11 +422,13 @@ IO.OnDraw(function(mini, state, translucent)
 			-- A single ClientsideModel renders many doors each frame. Source caches
 			-- its first bone transform unless bones are rebuilt between draws.
 			model:SetupBones()
-			model:DrawModel()
+			if shadowFlags then model:DrawModel(shadowFlags) else model:DrawModel() end
 			end
 		end
 	end
 	mini.mapIODoorLastPath, mini.mapIODoorLastScale, mini.mapIODoorLastSkin = lastPath, lastScale, lastSkin
-	mini.mapIODoorsDrawn = drawn
-	mini.mapIODoorsOccluded = hidden
+	if not shadowFlags then
+		mini.mapIODoorsDrawn = drawn
+		mini.mapIODoorsOccluded = hidden
+	end
 end)
