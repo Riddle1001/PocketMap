@@ -224,6 +224,16 @@ local function drawWorld( mini, options, translucent )
 	if not ok then error( err, 0 ) end
 end
 
+local flashlightOptions = { light = false, fullbright = false, flashlight = true }
+local function drawFlashlights( mini )
+	if Water.pass then return end
+	render.RenderFlashlights(function()
+		drawWorld( mini, flashlightOptions, false )
+		PocketMap.MapIO.Draw(mini, PocketMap.Materials.DrawOptions(flashlightOptions, mini.scale), false)
+		Props.Draw( mini, "opaque" )
+	end)
+end
+
 ---@param pass "opaque"|"translucent"|nil # nil draws both halves
 local function drawContents( mini, options, pass )
 	local lite = Water.pass ~= nil
@@ -238,6 +248,9 @@ local function drawContents( mini, options, pass )
 			if not Detail.Blends( mini ) then Detail.Draw( mini ) end
 			Props.Draw( mini, "opaque" )
 		end
+		-- Light opaque surfaces before translucent effects. Drawing this pass
+		-- over their quads erases the effects' transparency.
+		drawFlashlights( mini )
 	end
 
 	if doTranslucent then
@@ -270,16 +283,6 @@ function Mini:DrawScene( options )
 	render.OverrideDepthEnable( false )
 end
 
-local flashlightOptions = { light = false, fullbright = false, flashlight = true }
-local function drawFlashlights( mini )
-	if Water.pass then return end
-	render.RenderFlashlights(function()
-		drawWorld( mini, flashlightOptions, false )
-		PocketMap.MapIO.Draw(mini, PocketMap.Materials.DrawOptions(flashlightOptions, mini.scale), false)
-		Props.Draw( mini, "opaque" )
-	end)
-end
-
 ---@param pass "opaque"|"translucent"|nil
 function Mini:Draw( pass )
 	if self.state == "removed" or not self.scaleVec then return end
@@ -306,7 +309,6 @@ function Mini:Draw( pass )
 
 	render.OverrideDepthEnable( true, true )
 	drawContents( self, options, pass )
-	if pass ~= "translucent" then drawFlashlights( self ) end
 	render.OverrideDepthEnable( false )
 
 	if usesStencil then render.SetStencilEnable( false ) end

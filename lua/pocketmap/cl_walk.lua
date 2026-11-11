@@ -381,9 +381,14 @@ end
 
 local createMove, setupMove, runStep
 
+-- Source-map traces without creating a player or changing the active session.
+function Walk.CollisionSession(mini, io)
+	return setmetatable({ mini = mini, bsp = mini.bsp, nodes = mini.bsp:GetNodes(), leafs = mini.bsp:GetLeafs(),
+		displacements = mini.displacementCollision, physics = mini.physics or nil, io = io or PocketMap.MapIO.NewSession(mini) }, Session)
+end
+
 local function newWalkSession(ply, mini, io)
-	local session = setmetatable({ mini = mini, bsp = mini.bsp, nodes = mini.bsp:GetNodes(), leafs = mini.bsp:GetLeafs(), displacements = mini.displacementCollision, physics = mini.physics or nil }, Session)
-	session.io = io or PocketMap.MapIO.NewSession(mini)
+	local session = Walk.CollisionSession(mini, io)
 	local pos, angles = randomClearSpawn(session)
 	if not pos then return end
 	session.move = setmetatable({ origin = pos, velocity = Vector(), angles = angles, moveAngles = angles, buttons = 0, oldButtons = 0, forward = 0, side = 0, up = 0, maxSpeed = 320, maxClientSpeed = 320, impulse = 0, constraintCenter = Vector(), constraintRadius = 0, constraintWidth = 0, constraintSpeedFactor = 1, finalStepHeight = 0, finalIdealVelocity = Vector(), finalJumpVelocity = Vector() }, { __index = Move })

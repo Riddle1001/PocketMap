@@ -103,6 +103,7 @@ function Mini:Destroy()
 	PocketMap.Water.Free( self )
 	PocketMap.Sky.Free( self )
 	PocketMap.Props.Destroy( self )
+	PocketMap.Effects.Destroy( self )
 	PocketMap.RT.Release( self.atlasTarget )
 	PocketMap.RT.Release( self.atlasLayerTarget )
 
