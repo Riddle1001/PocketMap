@@ -4,11 +4,16 @@ vector.__index = vector
 function Vector(x, y, z) return setmetatable({ x = x or 0, y = y or 0, z = z or 0 }, vector) end
 function vector.__add(a, b) return Vector(a.x + b.x, a.y + b.y, a.z + b.z) end
 function vector.__sub(a, b) return Vector(a.x - b.x, a.y - b.y, a.z - b.z) end
+function vector.__unm(a) return Vector(-a.x, -a.y, -a.z) end
+function vector.__div(a, b) return Vector(a.x / b, a.y / b, a.z / b) end
 function vector.__mul(a, b)
 	if type(a) == "number" then a, b = b, a end
 	return Vector(a.x * b, a.y * b, a.z * b)
 end
 function vector:Length() return math.sqrt(self.x ^ 2 + self.y ^ 2 + self.z ^ 2) end
+function vector:LengthSqr() return self.x ^ 2 + self.y ^ 2 + self.z ^ 2 end
+function vector:Dot(b) return self.x * b.x + self.y * b.y + self.z * b.z end
+function vector:Cross(b) return Vector(self.y * b.z - self.z * b.y, self.z * b.x - self.x * b.z, self.x * b.y - self.y * b.x) end
 function vector:DistToSqr(b) return (self - b):Length() ^ 2 end
 function vector:GetNormalized() local len = self:Length() return len == 0 and Vector() or self * (1 / len) end
 function isvector(v) return getmetatable(v) == vector end
@@ -25,6 +30,7 @@ function angle:Right()
 	local y = math.rad(self.y)
 	return Vector(-math.sin(y), math.cos(y), 0)
 end
+function angle:Up() return Vector(0, 0, 1) end
 function LocalToWorld(pos, _, origin, angles)
 	local y = math.rad(angles.y)
 	return origin + Vector(pos.x * math.cos(y) - pos.y * math.sin(y), pos.x * math.sin(y) + pos.y * math.cos(y), pos.z)
@@ -34,6 +40,10 @@ function math.Clamp(n, a, b) return math.max(a, math.min(b, n)) end
 function math.Approach(n, target, amount) return n < target and math.min(target, n + amount) or math.max(target, n - amount) end
 
 function string.Trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
+function CreateClientConVar() return { GetBool = function() return true end } end
+hook = { Add = function() end }
+function ClientsideModel() return nil end
+function IsValid(value) return value ~= nil and value ~= false end
 PocketMap = { Entities = {} }
 function PocketMap.Entities.First(v) return type(v) == "table" and getmetatable(v) == nil and v[1] or v end
 function PocketMap.Entities.Class(ent) return tostring(ent.classname or ""):lower() end
@@ -58,7 +68,7 @@ local function world(entities)
 	local state = IO.NewSession(mini)
 	local move = { origin = Vector(-200, 0, 0), velocity = Vector(4, 1, 2), angles = Angle(0, 20, 0), buttons = 0, oldButtons = 0 }
 	function move:KeyPressed(key) return self.buttons == key and self.oldButtons ~= key end
-	local session = { io = state, move = move, yawOffset = 5 }
+	local session = { io = state, move = move, yawOffset = 5, mini = mini }
 	return session, state
 end
 
@@ -99,6 +109,7 @@ function tests.hot_reload()
 	assert(#IO.steps == steps and #IO.draws == draws, "core refresh changed callback counts")
 	dofile("lua/pocketmap/mapio/cl_buttons.lua")
 	dofile("lua/pocketmap/mapio/cl_doors.lua")
+	dofile("lua/pocketmap/mapio/cl_teleport.lua")
 	assert(#IO.steps == steps and #IO.draws == draws, "handler refresh duplicated callbacks")
 	assert(IO.registrationVersion > version, "handler refresh did not register its new revision")
 	print("PASS hot reload: handlers preserved, callbacks replaced")
@@ -158,6 +169,86 @@ function tests.teleport()
 	advance(session, 1)
 	assert(session.move.origin.x == 100, "teleport failed on re-entry")
 	print("PASS teleport: trigger, destination, yaw, velocity, outputs, re-entry")
+end
+
+local function boxBrush(lo, hi)
+	local sides = {}
+	for _, axis in ipairs({ "x", "y", "z" }) do
+		for _, sign in ipairs({ -1, 1 }) do
+			local n = Vector()
+			n[axis] = sign
+			sides[#sides + 1] = { plane = { normal = n, dist = sign < 0 and -lo[axis] or hi[axis] } }
+		end
+	end
+	return { sides = sides }
+end
+
+local function triggerWorld(brushes, lo, hi, origin, angles)
+	local model = { mins = lo, maxs = hi, headnode = 0 }
+	local bsp = {
+		GetBModels = function() return { [1] = model } end,
+		GetNodes = function() return { [0] = { children = { -1, -2 } } } end,
+		GetLeafs = function() return {
+			[0] = { GetBrushes = function() return brushes end },
+			[1] = { GetBrushes = function() return { brushes[1] } end },
+		} end,
+	}
+	local mini = { bsp = bsp }
+	IO.Build(mini, {
+		{ classname = "trigger_teleport", model = "*1", origin = origin, angles = angles, target = "exit" },
+		{ classname = "info_teleport_destination", targetname = "exit", origin = Vector(10000, 0, 0) },
+	})
+	return { mini = mini, io = IO.NewSession(mini), yawOffset = 0,
+		move = { origin = Vector(), velocity = Vector(), angles = Angle(), buttons = 0, oldButtons = 0,
+			KeyPressed = function() return false end } }
+end
+
+function tests.surf_ace_drop()
+	-- surf_ace bmodel *5, Hammer 1578: four reset brushes around the drop.
+	local brushes = {
+		boxBrush(Vector(-1632, -768, -16), Vector(-1120, 768, 16)),
+		boxBrush(Vector(-64, -768, -16), Vector(1632, 768, 0)),
+		boxBrush(Vector(-1120, 512, -16), Vector(-96, 768, 16)),
+		boxBrush(Vector(-1120, -768, -16), Vector(-96, -512, 16)),
+	}
+	local session = triggerWorld(brushes, Vector(-1632, -768, -16), Vector(1632, 768, 16), Vector(3616, -128, -272), Angle())
+	local trigger = IO.OfClass(session.io.world, "trigger_teleport")[1]
+	session.move.origin = Vector(3104, -128, -272)
+	assert(IO.Overlaps(session, trigger), "drop fixture must reproduce the old bounding-box reset")
+	advance(session)
+	assert(session.move.origin.x == 3104, "surf_ace drop opening incorrectly reset the walker")
+	assert(#trigger.teleportBrushes == 4, "leaf traversal failed to deduplicate trigger brushes")
+	session.move.origin = Vector(3700, -128, -272)
+	advance(session)
+	assert(session.move.origin.x == 10000, "solid part of surf_ace reset trigger stopped working")
+	local other = { mini = session.mini, io = IO.NewSession(session.mini), move = { origin = Vector(3104, -128, -272) } }
+	assert(not IO.TeleportOverlaps(other, trigger), "cached geometry changed between walking sessions")
+	print("PASS surf_ace drop: opening preserved, reset brushes active, leaf deduplication, session reuse")
+end
+
+function tests.teleport_shape_and_hull()
+	local brush = boxBrush(Vector(-100, -100, 0), Vector(100, 100, 100))
+	brush.sides[#brush.sides + 1] = { plane = { normal = Vector(1, 0, 1):GetNormalized(), dist = 0 } }
+	local session = triggerWorld({ brush }, Vector(-100, -100, 0), Vector(100, 100, 100), Vector(200, 300, 0), Angle(0, 90, 0))
+	local trigger = IO.OfClass(session.io.world, "trigger_teleport")[1]
+	session.move.origin = Vector(200, 350, 20)
+	assert(IO.Overlaps(session, trigger) and not IO.TeleportOverlaps(session, trigger), "rotated slope triggered in its empty bounding-box corner")
+	session.move.origin = Vector(200, 220, 20)
+	assert(IO.TeleportOverlaps(session, trigger), "rotated sloping brush failed to detect a real touch")
+
+	local ceiling = boxBrush(Vector(-100, -100, 60), Vector(100, 100, 80))
+	session = triggerWorld({ ceiling }, Vector(-100, -100, 60), Vector(100, 100, 80), Vector(), Angle())
+	trigger = IO.OfClass(session.io.world, "trigger_teleport")[1]
+	local oldMovement, oldLocalPlayer = PocketMap.Movement, LocalPlayer
+	LocalPlayer = function() return {} end
+	PocketMap.Movement = { PlayerHull = function(_, ducking)
+		return Vector(-16, -16, 0), Vector(16, 16, ducking and 36 or 72)
+	end }
+	assert(IO.TeleportOverlaps(session, trigger), "standing hull missed trigger at head height")
+	session.ducking = true
+	assert(not IO.TeleportOverlaps(session, trigger), "crouched hull triggered at standing head height")
+	PocketMap.Movement, LocalPlayer = oldMovement, oldLocalPlayer
+	print("PASS teleport shape and hull: rotated planes, empty corners, standing and crouched hulls")
 end
 
 function tests.doors()
@@ -307,11 +398,13 @@ function tests.spatial_trace()
 	assert(trace(500, 600).Fraction == 1, "distant brush caused a false collision")
 
 	IO.State(state, door).origin = Vector(1024, 0, 0)
+	IO.PoseChanged(state, door)
 	session.command = 2
 	assert(trace(-100, 100).Fraction == 1, "moved brush remained in its previous cells")
 	assert(trace(900, 1100).Entity == door, "moved brush was missing from its new cells")
 
 	IO.State(state, door).angles = Angle(0, 90, 0)
+	IO.PoseChanged(state, door)
 	session.command = 3
 	assert(traceY(-70, -30, 1024).Entity == door, "rotated brush was missing from the spatial index")
 	print("PASS spatial trace: nearby collision, distant rejection, moved and rotated brushes")

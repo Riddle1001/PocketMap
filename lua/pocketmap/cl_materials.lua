@@ -1,6 +1,7 @@
 PocketMap = PocketMap or {}
-PocketMap.Materials = {}
+PocketMap.Materials = PocketMap.Materials or {}
 local Materials = PocketMap.Materials
+Materials.scaled = Materials.scaled or {}
 
 local CUBEMAP_COPY_PATTERN = "^maps/[^/]+/(.+)_%-?%d+_%-?%d+_%-?%d+$"
 
@@ -37,4 +38,53 @@ end
 ---@return boolean
 function Materials.IsSkyName( name )
 	return type( name ) == "string" and string.find( string.lower( name ), "toolsskybox", 1, true ) ~= nil
+end
+
+local function materialProxies(name, seen)
+	name = name:gsub("^materials/", ""):gsub("%.vmt$", "")
+	if seen[name] then return end
+	seen[name] = true
+	local text = file.Read("materials/" .. name .. ".vmt", "GAME")
+	local values = text and util.KeyValuesToTable(text)
+	if not values then return end
+	local proxies = values.include and materialProxies(values.include, seen)
+	return values.proxies or (values.replace and values.replace.proxies)
+		or (values.insert and values.insert.proxies) or proxies
+end
+
+-- Seamless shaders cache their world-position mapping scale in the material's
+-- static command buffer. SetFloat around each draw cannot reliably update it.
+-- Give each scale its own snapshot and leave the real map's material untouched.
+function Materials.ForScale(material, scale)
+	if not scale or scale ~= scale or scale <= 0 or scale == math.huge or scale == 1 then return material end
+	local seamless = material:GetFloat("$seamless_scale")
+	if not seamless or seamless == 0 then return material end
+	local key = material:GetName() .. ":" .. string.format("%.17g:%.17g", scale, seamless)
+	local cached = Materials.scaled[key]
+	if cached then return cached end
+	local values, matrices, textures = {}, {}, {}
+	for name, value in pairs(material:GetKeyValues()) do
+		if type(value) == "ITexture" then
+			values[name], textures[name] = value:GetName(), value
+		elseif ismatrix(value) then
+			matrices[name] = value
+		elseif isvector(value) then
+			values[name] = string.format("[%g %g %g]", value.x, value.y, value.z)
+		else
+			values[name] = value
+		end
+	end
+	values["$seamless_scale"] = seamless / scale
+	values.Proxies = materialProxies(material:GetName(), {})
+	local shader = material:GetShader():gsub("_DX%d+$", "")
+	local copy = CreateMaterial("PocketMap_Scaled_v1_" .. util.CRC(key), shader, values)
+	for name, texture in pairs(textures) do copy:SetTexture(name, texture) end
+	for name, matrix in pairs(matrices) do copy:SetMatrix(name, matrix) end
+	copy:Recompute()
+	Materials.scaled[key] = copy
+	return copy
+end
+
+function Materials.DrawOptions(options, scale)
+	return setmetatable({ material = function(material) return Materials.ForScale(material, scale) end }, { __index = options })
 end

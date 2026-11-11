@@ -29,6 +29,7 @@ local CLIENT_FILES = {
 	"pocketmap/cl_hologram.lua",
 	"pocketmap/cl_water.lua",
 	"pocketmap/cl_miniature.lua",
+	"pocketmap/cl_effects.lua",
 	"pocketmap/cl_pvs_freeze.lua",
 	"pocketmap/cl_atlas.lua",
 	"pocketmap/cl_propmesh.lua",
@@ -55,6 +56,7 @@ if SERVER then
 	util.AddNetworkString( "PocketMap_Select" )
 	util.AddNetworkString( "PocketMap_Ply" )
 	util.AddNetworkString( "PocketMap_PlyRelay" )
+	util.AddNetworkString( "PocketMap_Respawn" )
 
 	for _, path in ipairs( CLIENT_FILES ) do AddCSLuaFile( path ) end
 end

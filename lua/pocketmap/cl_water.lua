@@ -7,6 +7,8 @@ PocketMap.Water = PocketMap.Water or {}
 local Water = PocketMap.Water
 
 local RT_SCALE = 0.5
+local WATER_RT_FLAGS = 4 + 8 -- TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT
+local BUDGETED_REFRESH_SECONDS = 1 / 14
 local SPREAD = 2
 local MAX_PLANES = 32
 local MAX_RENDERED_HEIGHTS = 4
@@ -18,10 +20,11 @@ local PVS_MAX_LEAFS = 512
 local REFLECTION_TONE_SCALE = 0.25
 local ENGINE_REFLECTION, ENGINE_REFRACTION = "_rt_WaterReflection", "_rt_WaterRefraction"
 
-local cvWater = CreateClientConVar( "pocketmap_water", "0", true, false,
-	"1 = water with a reflection and a refraction of the tiny map (draws the map two more times a frame while the eye is inside a block with water).", 0, 1 )
+local cvWater = CreateClientConVar( "pocketmap_water", "1", true, false,
+	"0 = flat water, 1 = budgeted reflection/refraction, 2 = full reflection/refraction every frame.", 0, 2 )
 
 Water.pass = nil
+Water.sceneView = nil
 Water.broken = false
 Water.error = nil
 Water.fovParam = nil
@@ -58,12 +61,6 @@ local function readVMT( name )
 	return parsed
 end
 
-local DEFAULT_PARAMS = {
-	["$abovewater"] = "1", ["$normalmap"] = "dev/water_normal", ["$bumpmap"] = "dev/water_dudv", ["$scale"] = "[1 1]",
-	["$refractamount"] = "1", ["$reflectamount"] = "0.4", ["$fogenable"] = "1", ["$fogcolor"] = "{7 58 66}",
-	["$fogstart"] = "0", ["$fogend"] = "1024", ["$surfaceprop"] = "water",
-}
-
 ---"{7 58 66}" or "[0.03 0.2 0.25]" -> 0-255 numbers
 local function parseColor( text )
 	local a, b, c = string.match( tostring( text or "" ), "([%d%.]+)%s+([%d%.]+)%s+([%d%.]+)" )
@@ -71,6 +68,17 @@ local function parseColor( text )
 	if not ( a and b and c ) then return 7, 58, 66 end
 	if string.find( text, "[", 1, true ) and math.max( a, b, c ) <= 1 then return a * 255, b * 255, c * 255 end
 	return a, b, c
+end
+
+-- An included/patch VMT does not contain its base material's fog values.
+-- Material() has already resolved them, including the map's cubemap patch.
+local function materialFog( material, source )
+	local params = source or {}
+	local start = tonumber( params["$fogstart"] ) or material:GetFloat( "$fogstart" ) or 0
+	local finish = tonumber( params["$fogend"] ) or material:GetFloat( "$fogend" ) or 1024
+	if finish <= start then finish = start + 1024 end
+	local r, g, b = parseColor( params["$fogcolor"] or material:GetString( "$fogcolor" ) )
+	return { r = math.floor( r ), g = math.floor( g ), b = math.floor( b ) }, finish - start
 end
 
 -- Targets: a plane starts on tiny flat-color targets (shared per fog color) and gets full size ones, shared per height,
@@ -148,7 +156,8 @@ local function releaseHeightTargets( rec )
 
 	PocketMap.RT.Release( rec.reflect )
 	PocketMap.RT.Release( rec.refract )
-	rec.reflect, rec.refract = nil, nil
+	rec.reflect, rec.refract, rec.flags = nil, nil, nil
+	rec.valid, rec.nextRefresh = false, nil
 
 	if heldHeights[rec] then
 		heldHeights[rec] = nil
@@ -175,20 +184,22 @@ end
 ---@return boolean ok # false if there are none to give: the water stays flat
 local function acquireHeightTargets( rec )
 	local w, h = math.max( math.floor( ScrW() * RT_SCALE ), 256 ), math.max( math.floor( ScrH() * RT_SCALE ), 256 )
-	if rec.reflect and rec.w == w and rec.h == h then return true end
+	if rec.reflect and rec.w == w and rec.h == h and rec.flags == WATER_RT_FLAGS then return true end
 
 	releaseHeightTargets( rec )
 	if heldCount >= MAX_RENDERED_HEIGHTS and not evictStalest() then return false end
 
-	local reflect = PocketMap.RT.Acquire( w, h, { depth = true } )
-	local refract = PocketMap.RT.Acquire( w, h, { depth = true } )
+	local reflect = PocketMap.RT.Acquire( w, h, { depth = true, flags = WATER_RT_FLAGS } )
+	local refract = PocketMap.RT.Acquire( w, h, { depth = true, flags = WATER_RT_FLAGS } )
 	if not reflect or not refract then
 		PocketMap.RT.Release( reflect )
 		PocketMap.RT.Release( refract )
 		return false
 	end
 
-	rec.reflect, rec.refract, rec.w, rec.h = reflect, refract, w, h
+	rec.reflect, rec.refract, rec.w, rec.h, rec.flags = reflect, refract, w, h, WATER_RT_FLAGS
+	rec.valid = false
+	rec.nextRefresh = nil
 	heldHeights[rec] = true
 	heldCount = heldCount + 1
 
@@ -209,13 +220,11 @@ end
 ---@param source table? # the parameters of the .vmt
 ---@return table? plane # nil if the flat targets can't be made
 local function makePlane( mini, key, z, source, material )
-	local params = source or DEFAULT_PARAMS
-	local fogStart, fogEnd = tonumber( params["$fogstart"] ) or 0, tonumber( params["$fogend"] ) or 1024
-	local r, g, b = parseColor( params["$fogcolor"] )
+	local fog, fogRange = materialFog( material, source )
 
 	local plane = {
 		key = key, z = z, material = material,
-		fog = { r = math.floor( r ), g = math.floor( g ), b = math.floor( b ) }, fogRange = math.max( fogEnd - fogStart, 1024 ),
+		fog = fog, fogRange = fogRange, fogResolved = true,
 		fogStart = 0, fogEnd = 1024,
 		meshes = {}, faces = 0, vmt = source ~= nil,
 		mins = Vector( math.huge, math.huge, z ), maxs = Vector( -math.huge, -math.huge, z ),
@@ -229,9 +238,25 @@ local function makePlane( mini, key, z, source, material )
 	return plane
 end
 
+-- A miniature may survive a clientside hot reload. Correct its old default
+-- fog and flat targets without forcing a map reload or leaking render targets.
+local function resolveOldFog( mini, plane )
+	if plane.fogResolved then return end
+	plane.fogResolved = true
+	local fog, range = materialFog( plane.material )
+	plane.fogRange = range
+	if plane.fog.r == fog.r and plane.fog.g == fog.g and plane.fog.b == fog.b then return end
+	local flat = acquireFlat( mini, fog )
+	if not flat then return end
+	local usingFlat = plane.reflectRT == plane.flat.reflect
+	plane.flat, plane.fog = flat, fog
+	if usingFlat then useFlatTargets( plane ) end
+end
+
 ---A material can be shared by several planes. Save its original parameters once per draw and only update values that change.
-local function bind( plane, materials )
+local function bind( plane, materials, screenRefraction )
 	local material = plane.material
+	local refractRT = screenRefraction and plane.rendered and screenRefraction or plane.refractRT
 	local saved = materials[material]
 	local changed = false
 	if not saved then
@@ -249,9 +274,9 @@ local function bind( plane, materials )
 		saved.currentReflect = plane.reflectRT
 		changed = true
 	end
-	if saved.currentRefract ~= plane.refractRT then
-		material:SetTexture( "$refracttexture", plane.refractRT )
-		saved.currentRefract = plane.refractRT
+	if saved.currentRefract ~= refractRT then
+		material:SetTexture( "$refracttexture", refractRT )
+		saved.currentRefract = refractRT
 		changed = true
 	end
 	if saved.currentExpensive ~= 1 then
@@ -290,9 +315,17 @@ end
 
 local TANGENT_S, TANGENT_T = Vector( 1, 0, 0 ), Vector( 0, 1, 0 )
 
+-- Water shader normals use the face UVs directly (including the extra scrolling layers).
+-- At miniature scale the original UV frequency can be tens of times denser on screen,
+-- making the animated normals shimmer when the camera moves.
+local function waterUVScale( scale )
+	return math.min( 1, math.sqrt( math.max( scale or 1, 0 ) ) )
+end
+
 ---The Water shader needs a tangent space, which the NikNaks MeshBuilder doesn't write. The surface is flat: S along x, T along y.
-local function buildMeshes( plane, faces )
+local function buildMeshes( plane, faces, uvScale )
 	local yield = coroutine.yield
+	uvScale = uvScale or 1
 	local verts, n = {}, 0
 	for i, face in ipairs( faces ) do
 		local triangles = face:GenerateVertexTriangleData()
@@ -324,7 +357,7 @@ local function buildMeshes( plane, faces )
 			mesh.Normal( v.normal )
 			mesh.TangentS( TANGENT_S )
 			mesh.TangentT( TANGENT_T )
-			mesh.TexCoord( 0, v.u, v.v )
+			mesh.TexCoord( 0, v.u * uvScale, v.v * uvScale )
 			mesh.Color( 255, 255, 255, 255 )
 			mesh.AdvanceVertex()
 		end
@@ -424,11 +457,12 @@ function Water.Build( mini, key, material, faces )
 	for _, z in ipairs( order ) do
 		local plane = makePlane( mini, key, z, source, material )
 		if plane then
+			plane.uvScale = waterUVScale( mini.scale )
 			plane.faces = #byHeight[z]
 			planes[#planes + 1] = plane
 			local rec = heightRecord( mini, z )
 			rec.planes[#rec.planes + 1] = plane
-			buildMeshes( plane, byHeight[z] )
+			buildMeshes( plane, byHeight[z], plane.uvScale )
 			preparePlanePVS( mini, plane )
 		else
 			table.Add( rest, byHeight[z] )
@@ -442,14 +476,92 @@ function Water.Build( mini, key, material, faces )
 	if not loose then return rest end
 
 	loose.loose, loose.faces = true, #rest
+	loose.uvScale = waterUVScale( mini.scale )
 	-- Loose water is sloped, so its bounds must include its actual Z range.
 	loose.mins.z, loose.maxs.z = math.huge, -math.huge
 	mini.waterLoose = mini.waterLoose or {}
 	mini.waterLoose[#mini.waterLoose + 1] = loose
-	buildMeshes( loose, rest )
+	buildMeshes( loose, rest, loose.uvScale )
 	loose.bounds3D = true
 	preparePlanePVS( mini, loose )
 	return {}
+end
+
+-- Rebuild water already loaded before a clientside hot reload. Keep drawing the
+-- old meshes until their replacements are ready, then swap each plane at once.
+function Water.RebuildUVs( mini )
+	if not mini or not mini.bsp then return false end
+	if Water.uvRebuild and not Water.uvRebuild.done then return false end
+
+	local groups, planes = {}, {}
+	for _, list in ipairs( { mini.waterPlanes or {}, mini.waterLoose or {} } ) do
+		for _, plane in ipairs( list ) do
+			local group = groups[plane.key] or {}
+			groups[plane.key] = group
+			group[plane.loose and "loose" or plane.z] = plane
+			planes[#planes + 1] = plane
+		end
+	end
+
+	local job = { done = false, rebuilt = 0, skipped = 0, total = #planes }
+	Water.uvRebuild = job
+	local thread = coroutine.create( function()
+		local facesByPlane = {}
+		local count = 0
+		for _, face in pairs( mini.bsp:GetFaces() ) do
+			local group = groups[face:GetTexture()]
+			if group then
+				local plane = group[levelHeight( face ) or "loose"]
+				if plane then
+					facesByPlane[plane] = facesByPlane[plane] or {}
+					facesByPlane[plane][#facesByPlane[plane] + 1] = face
+				end
+			end
+			count = count + 1
+			if count % 250 == 0 then coroutine.yield() end
+		end
+
+		local uvScale = waterUVScale( mini.scale )
+		for _, plane in ipairs( planes ) do
+			local faces = facesByPlane[plane] or {}
+			if #faces ~= plane.faces then
+				job.skipped = job.skipped + 1
+			else
+				local replacement = {
+					material = plane.material, meshes = {},
+					mins = Vector( math.huge, math.huge, math.huge ),
+					maxs = Vector( -math.huge, -math.huge, -math.huge ),
+				}
+				job.building = replacement
+				buildMeshes( replacement, faces, uvScale )
+				if mini.state == "removed" then return end
+				local old = plane.meshes
+				plane.meshes, plane.uvScale = replacement.meshes, uvScale
+				job.building = nil
+				for _, meshObject in ipairs( old ) do meshObject:Destroy() end
+				job.rebuilt = job.rebuilt + 1
+			end
+			coroutine.yield()
+		end
+	end )
+
+	hook.Add( "Think", "PocketMap_WaterUVRebuild", function()
+		local deadline = SysTime() + 0.002
+		repeat
+			local ok, err = coroutine.resume( thread )
+			if not ok then job.error = tostring( err ) end
+			if not ok or coroutine.status( thread ) == "dead" then
+				if job.building then
+					for _, meshObject in ipairs( job.building.meshes ) do meshObject:Destroy() end
+					job.building = nil
+				end
+				job.done = true
+				hook.Remove( "Think", "PocketMap_WaterUVRebuild" )
+				return
+			end
+		until SysTime() >= deadline
+	end )
+	return true
 end
 
 function Water.Free( mini )
@@ -485,7 +597,7 @@ local function drawView()
 	return view.waterDrawView
 end
 
-local function drawPlanes( mini, planes, materials, currentMaterial, view, pvs )
+local function drawPlanes( mini, planes, materials, currentMaterial, view, pvs, screenRefraction )
 	for _, plane in ipairs( planes ) do
 		-- Also handles water planes already loaded before a clientside hot reload.
 		if plane.pvsBSP ~= mini.bsp then preparePlanePVS( mini, plane ) end
@@ -496,7 +608,7 @@ local function drawPlanes( mini, planes, materials, currentMaterial, view, pvs )
 				if mins then visible = boxVisible( mins, maxs, 1, view ) end
 			end
 			if visible then
-				local changed = bind( plane, materials )
+				local changed = bind( plane, materials, screenRefraction )
 				if changed or currentMaterial ~= plane.material then
 					render.SetMaterial( plane.material )
 					currentMaterial = plane.material
@@ -508,8 +620,8 @@ local function drawPlanes( mini, planes, materials, currentMaterial, view, pvs )
 	return currentMaterial
 end
 
-local function drawWater( mini, planes, loose, materials, view, pvs )
-	local currentMaterial = drawPlanes( mini, planes, materials, nil, view, pvs )
+local function drawWater( mini, planes, loose, materials, view, pvs, screenRefraction )
+	local currentMaterial = drawPlanes( mini, planes, materials, nil, view, pvs, screenRefraction )
 	if loose then drawPlanes( mini, loose, materials, currentMaterial, view, pvs ) end
 end
 
@@ -517,14 +629,28 @@ end
 function Water.Draw( mini )
 	local planes, loose = mini.waterPlanes, mini.waterLoose
 	if Water.pass or not planes or ( #planes == 0 and ( not loose or #loose == 0 ) ) then return end
+	for _, plane in ipairs( planes ) do resolveOldFog( mini, plane ) end
+	for _, plane in ipairs( loose or {} ) do resolveOldFog( mini, plane ) end
 
 	local view = drawView()
 	-- The opaque world was drawn immediately before water, using this same
 	-- view. Its PVS is valid only for the walker's camera inside the miniature.
 	local pvs = view and mini.worldPVSActive and ( PocketMap.PVSFreeze.Get( mini ) or mini.worldPVS )
 	local materials = {}
+	local screenRefraction
+	if not ( render.GetRenderTarget and render.GetRenderTarget() ) then
+		for _, plane in ipairs( planes ) do
+			if plane.rendered then
+				-- Water's projected UVs address the current framebuffer. A separately
+				-- rendered miniature camera produces a moving, misaligned refraction.
+				render.UpdateRefractTexture()
+				screenRefraction = render.GetPowerOfTwoTexture()
+				break
+			end
+		end
+	end
 	cam.PushModelMatrix( mini.matrix )
-	local ok, err = pcall( drawWater, mini, planes, loose, materials, view, pvs )
+	local ok, err = pcall( drawWater, mini, planes, loose, materials, view, pvs, screenRefraction )
 	for material, saved in pairs( materials ) do unbind( material, saved ) end
 	cam.PopModelMatrix()
 	if not ok then error( err, 0 ) end
@@ -622,34 +748,23 @@ local function in3D( plane, origin, angles, view, znear, zfar, fn )
 	if not ok then error( err, 0 ) end
 end
 
-local function drawSceneClipped( mini, normal, distance )
+local function drawSceneClipped( mini, normal, distance, sceneView )
 	local oldClipping = render.EnableClipping( true )
 	render.PushCustomClipPlane( normal, distance )
+	local previousView = Water.sceneView
+	Water.sceneView = sceneView
 	local ok, err = pcall( mini.DrawScene, mini, mini:WaterDrawOptions() )
+	Water.sceneView = previousView
 	render.PopCustomClipPlane()
 	render.EnableClipping( oldClipping )
 	if not ok then error( err, 0 ) end
 end
 
-local function renderRefraction( mini, plane, zWorld, spread, view )
-	Water.pass = "refraction"
-
-	withTarget( plane.refractRT, function()
-		render.Clear( plane.fog.r, plane.fog.g, plane.fog.b, 255, true, true )
-
-		local znear, zfar = depthRange( mini, view.origin, view )
-		in3D( plane, view.origin, view.angles, view, znear, zfar, function()
-			render.SetWriteDepthToDestAlpha( true )
-			local ok, err = pcall( drawSceneClipped, mini, Vector( 0, 0, -1 ), -( zWorld + spread ) )
-			render.SetWriteDepthToDestAlpha( false )
-			if not ok then error( err, 0 ) end
-		end )
-	end )
-end
-
 local function drawMirroredSky( mini, plane, origin, angles, view, znear, zfar )
 	render.Clear( 0, 0, 0, 255, true, true )
-	in3D( plane, origin, angles, view, znear, zfar, function()
+	-- The sky cube is 1024 units from the eye. The miniature's depth
+	-- range is often shorter, which clips away the sky in reflections.
+	in3D( plane, origin, angles, view, znear, math.max( zfar, 2048 ), function()
 		PocketMap.Sky.DrawCube( mini, origin, { angles = angles, fov = view.fov, w = plane.w, h = plane.h } )
 	end )
 	render.ClearDepth()
@@ -669,16 +784,15 @@ local function renderReflection( mini, plane, zWorld, spread, view )
 		if mini.skyBackdrop then drawMirroredSky( mini, plane, origin, angles, view, znear, zfar ) end
 
 		in3D( plane, origin, angles, view, znear, zfar, function()
-			drawSceneClipped( mini, Vector( 0, 0, 1 ), zWorld - spread )
+			drawSceneClipped( mini, Vector( 0, 0, 1 ), zWorld - spread,
+				{ origin = origin, angles = angles, fov = view.fov, width = plane.w, height = plane.h } )
 		end )
 	end )
 end
 
-local function renderPlane( mini, plane, zWorld, spread, view )
+local function renderPlane( mini, plane, zWorld, spread, view, pass )
 	local toneScale = render.GetToneMappingScaleLinear and render.GetToneMappingScaleLinear()
 	local hdr = toneScale and render.GetHDREnabled and render.GetHDREnabled()
-
-	renderRefraction( mini, plane, zWorld, spread, view )
 
 	if hdr then render.SetToneMappingScaleLinear( toneScale * REFLECTION_TONE_SCALE ) end
 	local ok, err = pcall( renderReflection, mini, plane, zWorld, spread, view )
@@ -762,6 +876,7 @@ end
 
 local function turnOffEffects( err )
 	Water.pass = nil
+	Water.sceneView = nil
 	Water.broken, Water.error = true, tostring( err )
 	ErrorNoHalt( "[PocketMap] The water reflection / refraction failed and is turned off: " .. Water.error .. "\n" )
 end
@@ -777,7 +892,8 @@ local function visibleHeights( mini, view, scale )
 	for _, rec in pairs( mini.waterHeights or {} ) do
 		for _, plane in ipairs( rec.planes ) do
 			local wmins, wmaxs, zWorld = planeWorldBounds( mini, plane )
-			if view.origin.z > zWorld and boxVisible( wmins, wmaxs, BOX_PAD_SCALE * scale, view ) then
+			if view.origin.z > zWorld
+				and boxVisible( wmins, wmaxs, BOX_PAD_SCALE * scale, view ) then
 				found[#found + 1] = { rec = rec, plane = plane, zWorld = zWorld, distanceSqr = view.origin:DistToSqr( ( wmins + wmaxs ) * 0.5 ) }
 				break
 			end
@@ -792,14 +908,29 @@ end
 ---@return boolean ok # false if the effects failed and were turned off
 local function renderHeight( mini, entry, view, scale )
 	local rec = entry.rec
+	local budgeted = false -- Temporary live cost measurement for synchronized passes.
+	local now = SysTime()
+	if budgeted and Water.budgetFrame == FrameNumber() then return true end
 	if not acquireHeightTargets( rec ) then return true end
+	if budgeted and rec.valid and now < ( rec.nextRefresh or 0 ) then
+		rec.lastFrame = FrameNumber()
+		for _, plane in ipairs( rec.planes ) do plane.lastFrame, plane.rendered = rec.lastFrame, true end
+		return true
+	end
 
-	local ok, err = pcall( renderPlane, mini, entry.plane, entry.zWorld, SPREAD * scale, view )
+	local pass = budgeted and rec.valid and rec.nextPass or nil
+	local ok, err = pcall( renderPlane, mini, entry.plane, entry.zWorld, SPREAD * scale, view, pass )
 	if not ok then
 		turnOffEffects( err )
 		return false
 	end
 
+	rec.valid = true
+	if budgeted then
+		Water.budgetFrame = FrameNumber()
+		rec.nextRefresh = now + BUDGETED_REFRESH_SECONDS
+		rec.nextPass = pass == "refraction" and "reflection" or "refraction"
+	end
 	rec.lastFrame = FrameNumber()
 	for _, plane in ipairs( rec.planes ) do
 		plane.lastFrame, plane.rendered, plane.cleared = rec.lastFrame, true, false
@@ -829,6 +960,11 @@ end
 
 ---A plane with no effects this frame holds its fog color (once), not whatever the target had.
 local function clearIdlePlanes( mini )
+	-- An inactive water height has shared full-size render targets. Return them
+	-- before clearing so toggling effects off never clears large targets needlessly.
+	for _, rec in pairs( mini.waterHeights or {} ) do
+		if rec.reflect and not rec.planes[1].rendered then releaseHeightTargets( rec ) end
+	end
 	for _, plane in ipairs( mini.waterPlanes or {} ) do
 		if not plane.rendered and not plane.cleared then clearPlane( plane ) end
 	end

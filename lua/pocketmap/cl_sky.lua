@@ -163,10 +163,44 @@ end
 
 local QUADS = buildQuads()
 local WINDINGS = { { "tl", "tr", "br", "bl" }, { "bl", "br", "tr", "tl" } }
+local TRIANGLES = { "tl", "tr", "br", "tl", "br", "bl", "bl", "br", "tr", "bl", "tr", "tl" }
+
+-- The cube geometry never changes. Keep one GPU mesh per side of each map,
+-- while continuing to update the sky material for animated painted skies.
+function Sky.Free( mini )
+	for _, entry in pairs( mini.skyCubeMeshes or {} ) do entry.mesh:Destroy() end
+	mini.skyCubeMeshes = nil
+end
+
+local function sideMesh( mini, side, material )
+	local meshes = mini.skyCubeMeshes
+	if not meshes then meshes = {} mini.skyCubeMeshes = meshes end
+	local entry = meshes[side]
+	if entry and entry.material == material then return entry.mesh end
+	if entry then entry.mesh:Destroy() end
+
+	local quad = QUADS[side]
+	local result = Mesh( material )
+	mesh.Begin( result, MATERIAL_TRIANGLES, 4 )
+	for i = 1, #TRIANGLES do
+		local corner = TRIANGLES[i]
+		mesh.Position( quad.position[corner] )
+		mesh.TexCoord( 0, quad.uv[corner][1], quad.uv[corner][2] )
+		mesh.Color( 255, 255, 255, 255 )
+		mesh.AdvanceVertex()
+	end
+	mesh.End()
+	meshes[side] = { material = material, mesh = result }
+	return result
+end
 
 ---Both windings, so it shows whichever way the material culls.
-local function drawSide( side, material )
+local function drawSide( mini, side, material )
 	render.SetMaterial( material )
+	if Sky.cachedCube ~= false then
+		sideMesh( mini, side, material ):Draw()
+		return
+	end
 	local quad = QUADS[side]
 
 	for _, winding in ipairs( WINDINGS ) do
@@ -222,7 +256,7 @@ function Sky.DrawCube( mini, eye, override )
 
 	for _, side in ipairs( SIDES ) do
 		if paint then applyPaint( backdrop[side], paint ) end
-		drawSide( side, backdrop[side] )
+		drawSide( mini, side, backdrop[side] )
 	end
 
 	if paint then g_SkyPaint = hostSkyPaint end
@@ -304,6 +338,7 @@ function Sky.Draw3D( mini, options )
 	if #objects == 0 or not mini.skyOrigin then return end
 
 	local matrix = updateSkyMatrix( mini )
+	options = PocketMap.Materials.DrawOptions(options, matrix:GetScale().x)
 
 	maskBlock( mini )
 	render.OverrideDepthEnable( true, true )

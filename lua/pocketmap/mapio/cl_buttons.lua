@@ -27,6 +27,7 @@ local function pose(state, record, button)
 	else
 		current.origin = record.origin + button.direction * (button.position * button.distance)
 	end
+	IO.PoseChanged(state, record)
 end
 
 local function press(state, record)

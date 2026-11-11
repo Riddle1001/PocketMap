@@ -103,6 +103,7 @@ local function readEntities( mini, job )
 	job.entities = job.bsp:GetEntities()
 	coroutine.yield()
 	PocketMap.MapIO.Build( mini, job.entities )
+	PocketMap.Effects.Build( mini, job.entities )
 
 	PocketMap.Sky.Read( mini, job.entities )
 end
@@ -404,14 +405,14 @@ local function buildWorldMeshes( mini, job )
 	coroutine.yield()
 end
 
-local function mountPackedMaterialsIfPossible( mini, job )
-	mini:SetStatus( "Mounting packed textures", 0.01 )
+local function mountPackedAssetsIfPossible( mini, job )
+	mini:SetStatus( "Mounting packed assets", 0.01 )
 
 	local ok, result = pcall( PocketMap.Pak.Mount, job.bsp, coroutine.yield )
 	if ok then
-		mini.packedMaterials = result
+		mini.packedAssets = result
 	else
-		print( "[PocketMap] " .. mini.mapName .. ": the packed materials were not mounted (" .. tostring( result ) .. ")" )
+		print( "[PocketMap] " .. mini.mapName .. ": the packed assets were not mounted (" .. tostring( result ) .. ")" )
 	end
 	coroutine.yield()
 end
@@ -420,7 +421,7 @@ function Loader.Run( mini )
 	local job = {}
 
 	if not openMap( mini, job ) then return end
-	mountPackedMaterialsIfPossible( mini, job )
+	mountPackedAssetsIfPossible( mini, job )
 	readLumps( mini, job )
 	if not fitToBlock( mini, job ) then return end
 	readEntities( mini, job )

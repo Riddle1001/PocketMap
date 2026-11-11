@@ -1,4 +1,4 @@
--- Returned to GTerm by PocketMap.GTerm.RunFile; never loaded by autorun.
+-- Returned to gmod-mcp by gmod-mcp lua_exec_file (client realm); never loaded by autorun.
 local walk = PocketMap and PocketMap.Walk and PocketMap.Walk.session
 if not walk then return "PocketMap.Walk.session is inactive" end
 local state = walk.io

@@ -49,6 +49,7 @@ for _, class in ipairs(MOVERS) do
 			if not mover.linear then return end
 			mover.position, mover.goal = math.Clamp(fraction, 0, 1), math.Clamp(fraction, 0, 1)
 			IO.State(state, record).origin = record.origin + mover.direction * mover.distance * mover.position
+			IO.PoseChanged(state, record)
 		end,
 		setspeed = function(state, record, value)
 			local speed = tonumber(value)
@@ -68,6 +69,7 @@ for _, class in ipairs(MOVERS) do
 			local mover = setup(state, record)
 			mover.path = path(state, IO.Value(target.entity, "target"))
 			IO.State(state, record).origin = target.origin
+			IO.PoseChanged(state, record)
 		end,
 	})
 end
@@ -82,6 +84,7 @@ IO.OnStep(function(session, state, dt)
 					local step = dt * mover.speed / math.max(mover.distance, 0.01)
 					mover.position = math.Approach(mover.position, mover.goal, step)
 					current.origin = record.origin + mover.direction * mover.distance * mover.position
+					IO.PoseChanged(state, record)
 					if mover.position == mover.goal then
 						mover.active = false
 						IO.Fire(state, record, mover.goal == 1 and "OnFullyOpen" or "OnFullyClosed", record, record)
@@ -91,12 +94,14 @@ IO.OnStep(function(session, state, dt)
 					local distance = difference:Length()
 					if distance <= dt * mover.speed then
 						current.origin = mover.path.origin
+						IO.PoseChanged(state, record)
 						IO.Fire(state, mover.path, "OnPass", record, record)
 						IO.Fire(state, mover.path, "OnTrigger", record, record)
 						mover.path = path(state, IO.Value(mover.path.entity, "target"))
 						if not mover.path then mover.active = false IO.Fire(state, record, "OnStop", record, record) end
 					elseif distance > 0 then
 						current.origin = current.origin + difference * (dt * mover.speed / distance)
+						IO.PoseChanged(state, record)
 					end
 				else
 					mover.active = false

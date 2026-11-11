@@ -18,7 +18,15 @@ local PVS_MAX_LEAFS = 128
 local CONTENTS_SOLID = 1
 local FRUSTUM_PAD = 4
 local FRUSTUM_FOV_PAD = 3
+local OCCLUSION_PAD = 5
+local OCCLUSION_MAX_RADIUS = 350
+local OCCLUSION_RECHECK_DISTANCE = 2
 local ZERO_ANGLE = Angle()
+
+local cvPropOcclusion = CreateClientConVar( "pocketmap_prop_occlusion", "1", true, false,
+	"Cull miniature props behind solid BSP surfaces while the viewer is stationary" )
+local cvPropFrustumCache = CreateClientConVar( "pocketmap_prop_frustum_cache", "1", true, false,
+	"Reuse prop frustum visibility while the camera and miniature stay still" )
 
 local DRAW_FLAGS = bit.bor( STUDIO_RENDER or 1, STUDIO_DRAWTRANSLUCENTSUBMODELS or 4 )
 local OPAQUE_FLAGS = STUDIO_RENDER or 1
@@ -166,6 +174,7 @@ end
 function Props.Destroy( mini )
 	if IsValid( mini.propEnt ) then mini.propEnt:Remove() end
 	mini.propEnt = nil
+	mini.propPassGroups, mini.skyPassGroups = nil, nil
 end
 
 ---Does the model have a material that blends with the background? Cached on the group: a model never changes.
@@ -336,6 +345,8 @@ function Props.Place( mini, job, lightToggle, bakeMeshes )
 	local bsp = job.bsp
 	local hdr = mini.lighting == "HDR"
 	mini.propPVSCluster, mini.propPVS, mini.propPVSBSP = nil, nil, nil
+	mini.propPassGroups, mini.skyPassGroups = nil, nil
+	mini.propOcclusion = nil
 
 	mini:SetStatus( "Reading the ambient light", 0.645 )
 	PocketMap.PropLight.Prepare( bsp, hdr )
@@ -373,6 +384,20 @@ end
 
 local function setModelLight( state, light )
 	if light == state.light then return end
+	-- Many static props have separately allocated but identical ambient cubes.
+	-- Avoid six render-state changes when the already bound colors match.
+	local previous = state.light
+	if previous then
+		local same = true
+		for side = 1, SIDES do
+			local a, b = previous[side], light[side]
+			if a[1] ~= b[1] or a[2] ~= b[2] or a[3] ~= b[3] then
+				same = false
+				break
+			end
+		end
+		if same then state.light = light return end
+	end
 
 	state.light = light
 	for side = 1, SIDES do
@@ -381,11 +406,14 @@ local function setModelLight( state, light )
 	end
 end
 
-local function drawParts( parts, translucent )
+local function drawParts( parts, translucent, state )
 	for i = 1, #parts do
 		local part = parts[i]
 		if part.translucent == translucent then
-			render.SetMaterial( part.material )
+			if state.material ~= part.material then
+				render.SetMaterial( part.material )
+				state.material = part.material
+			end
 			part.mesh:Draw()
 		end
 	end
@@ -428,6 +456,9 @@ local function drawEntityProp( entity, state, group, scale, skin, pos, ang, flag
 
 	entity:SetPos( pos )
 	entity:SetAngles( ang )
+	-- The same ClientsideModel is reused at multiple prop positions in one frame.
+	-- Rebuild its bones after each move or Source draws later props at the first pose.
+	entity:SetupBones()
 	entity:DrawModel( flags )
 end
 
@@ -459,6 +490,60 @@ local function visibleInPVS( prop, pvs )
 		end
 	end
 	return prop.pvsVisible
+end
+
+-- The prop geometry is static while walking a miniature. BSP visibility only
+-- changes when the eye changes cluster, so keep the visible portion of each
+-- model group and perform just the camera frustum test on subsequent frames.
+local function pvsCandidates( group, pvs )
+	local props = group.props
+	if not pvs then return props, #props end
+	if group.pvsSource == props and group.pvsData == pvs then
+		return group.pvsProps, group.pvsCount
+	end
+
+	local candidates = group.pvsProps or {}
+	local count = 0
+	for i = 1, #props do
+		local prop = props[i]
+		if visibleInPVS( prop, pvs ) then
+			count = count + 1
+			candidates[count] = prop
+		end
+	end
+	for i = count + 1, #candidates do candidates[i] = nil end
+	group.pvsSource, group.pvsData = props, pvs
+	group.pvsProps, group.pvsCount = candidates, count
+	return candidates, count
+end
+
+-- Model groups are fixed after placement. Build pass-specific lists once per
+-- PVS instead of visiting hidden or wrong-pass groups every render frame.
+local function passGroups( mini, pvs )
+	local groups = mini.propGroups
+	local cached = mini.propPassGroups
+	if cached and cached.source == groups and cached.count == #groups and cached.pvs == pvs then
+		return cached
+	end
+
+	local opaque, translucent = {}, {}
+	for i = 1, #groups do
+		local group = groups[i]
+		if not group.sky then
+			local _, count = pvsCandidates( group, pvs )
+			if count > 0 then
+				local parts = group.meshes
+				if not parts or parts.hasOpaque then opaque[#opaque + 1] = group end
+				if parts and parts.hasTranslucent or not parts and group.entTranslucent ~= false then
+					translucent[#translucent + 1] = group
+				end
+			end
+		end
+	end
+
+	cached = { source = groups, count = #groups, pvs = pvs, opaque = opaque, translucent = translucent }
+	mini.propPassGroups = cached
+	return cached
 end
 
 -- Use the active render view: the player's actual eye may be outside the miniature.
@@ -500,7 +585,7 @@ end
 -- An opaque and translucent pass can share their visible props only when the
 -- camera, PVS and block transform are unchanged. Nested/unknown views fail open.
 local function sameCullView( context, stamp, pvs, frustum )
-	if not context or not frustum or context.frame ~= FrameNumber()
+	if not context or not frustum or ( not cvPropFrustumCache:GetBool() and context.frame ~= FrameNumber() )
 		or context.stamp ~= stamp or context.pvs ~= pvs then return false end
 	local old = context.frustum
 	local a, b = old.origin, frustum.origin
@@ -523,7 +608,73 @@ local function visibleInFrustum( prop, frustum )
 	return true
 end
 
-local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse )
+-- BSP PVS can include rooms hidden by walls from this particular eye position.
+-- Test the center and all eight padded corners of an enclosing sphere; any
+-- unobstructed ray keeps the prop visible. Animated props have no fixed bounds.
+local function propBehindWorld( mini, prop, eye )
+	if not prop.lcenter or not prop.sphereRadius then return false end
+	local radius = prop.sphereRadius / mini.scale
+	if radius <= 0 or radius > OCCLUSION_MAX_RADIUS then return false end
+	local center = ( prop.lcenter - mini.boxCenter ) / mini.scale + mini.mapCenter
+	local bsp = mini.bsp
+	local function blocked( target )
+		local trace = bsp:SurfaceTraceLine( eye, target )
+		return trace and trace.Hit and not trace.HitSky and trace.Fraction < 0.96
+	end
+	if not blocked( center ) then return false end
+	local extent = radius + OCCLUSION_PAD
+	for x = -1, 1, 2 do for y = -1, 1, 2 do for z = -1, 1, 2 do
+		if not blocked( center + Vector( x * extent, y * extent, z * extent ) ) then return false end
+	end end end
+	return true
+end
+
+-- A moving eye invalidates its old occlusion results. The queue is populated
+-- by props actually encountered in the frustum, and one is traced per frame.
+-- Unknown views and BSPs without visibility information draw every prop.
+local function propOcclusion( mini, pvs, frustum )
+	if not cvPropOcclusion:GetBool() or not pvs or not frustum or not mini.bsp.SurfaceTraceLine then return nil end
+	local eye = ( frustum.origin - mini.boxCenter ) / mini.scale + mini.mapCenter
+	local cache = mini.propOcclusion
+	if not cache or cache.groups ~= mini.propGroups or cache.bsp ~= mini.bsp then
+		cache = { groups = mini.propGroups, bsp = mini.bsp, generation = 0 }
+		mini.propOcclusion = cache
+	end
+	if not cache.eye or cache.pvs ~= pvs or cache.eye:DistToSqr( eye ) > OCCLUSION_RECHECK_DISTANCE ^ 2 then
+		cache.eye, cache.pvs = eye, pvs
+		cache.generation = cache.generation + 1
+		cache.queue, cache.nextIndex, cache.count = {}, 1, 0
+		cache.nextAt = CurTime() + 0.2
+	end
+	return cache
+end
+
+local function propKnownHidden( prop, cache )
+	if not cache or not prop.lcenter then return false end
+	if prop.occlusionCache == cache and prop.occlusionGeneration == cache.generation then
+		return prop.occludedByWorld
+	end
+	if prop.occlusionQueuedCache ~= cache or prop.occlusionQueuedGeneration ~= cache.generation then
+		cache.count = cache.count + 1
+		cache.queue[cache.count] = prop
+		prop.occlusionQueuedCache, prop.occlusionQueuedGeneration = cache, cache.generation
+	end
+	return false
+end
+
+local function traceNextProp( mini, cache )
+	if not cache or cache.frame == FrameNumber() or CurTime() < cache.nextAt then return end
+	local index = cache.nextIndex
+	if index > cache.count then return end
+	cache.frame = FrameNumber()
+	cache.nextIndex = index + 1
+	local prop = cache.queue[index]
+	cache.queue[index] = nil
+	prop.occludedByWorld = propBehindWorld( mini, prop, cache.eye )
+	prop.occlusionCache, prop.occlusionGeneration = cache, cache.generation
+end
+
+local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse, occlusion )
 	local parts = group.meshes
 	if parts and not hasHalf( parts, translucent ) then return 0 end
 	if not parts and translucent and group.entTranslucent == false then return 0 end
@@ -531,23 +682,27 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 	local flags = DRAW_FLAGS
 	local prepared = parts ~= nil
 
-	local matrix, scaleVec = mini.propMatrix, mini.propScaleVec
 	local props = group.props
 	local drawn = 0
 	local cached = reuse and group.visibilityContext == context
-	local candidates = cached and group.visibleProps or props
-	local count = cached and group.visibleCount or #props
+	local candidates, count
+	if cached then
+		candidates, count = group.visibleProps, group.visibleCount
+	else
+		candidates, count = pvsCandidates( group, pvs )
+	end
 	local record = not translucent and context ~= nil
 	local visible = record and ( group.visibleProps or {} )
 	local visibleCount = 0
 
 	for i = 1, count do
 		local p = candidates[i]
-		if cached or ( visibleInPVS( p, pvs ) and visibleInFrustum( p, frustum ) ) then
+		if cached or visibleInFrustum( p, frustum ) then
 			if record then
 				visibleCount = visibleCount + 1
 				visible[visibleCount] = p
 			end
+			if not propKnownHidden( p, occlusion ) then
 			-- Skip expensive model and material setup when the entire group is culled.
 			if not prepared then
 				flags = prepareEntityGroup( entity, group, translucent )
@@ -564,17 +719,25 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 			setModelLight( state, p.light )
 
 			if parts then
-				scaleVec:SetUnpacked( p.lscale, p.lscale, p.lscale )
-				matrix:Identity()
-				matrix:SetTranslation( p.wpos )
-				matrix:SetAngles( p.wang )
-				matrix:SetScale( scaleVec )
+				-- The block's transform is unchanged on most frames. Reuse each
+				-- baked prop's matrix until the block moves instead of assembling
+				-- it before every draw in both passes.
+				if p.matrixStamp ~= stamp then
+					local matrix = p.drawMatrix or Matrix()
+					matrix:Identity()
+					matrix:SetTranslation( p.wpos )
+					matrix:SetAngles( p.wang )
+					matrix:SetScale( Vector( p.lscale, p.lscale, p.lscale ) )
+					p.drawMatrix, p.matrixStamp = matrix, stamp
+				end
 
-				cam.PushModelMatrix( matrix )
-				drawParts( parts, translucent )
+				cam.PushModelMatrix( p.drawMatrix )
+				drawParts( parts, translucent, state )
 				cam.PopModelMatrix()
 			else
 				drawEntityProp( entity, state, group, p.lscale, p.skin, p.wpos, p.wang, flags )
+				state.material = nil
+			end
 			end
 		end
 	end
@@ -588,10 +751,6 @@ end
 local function drawPass( mini, translucent )
 	if #mini.propGroups == 0 then return end
 
-	local entity = propEntity( mini )
-	local stamp, entPos, entAng = updateStamp( mini )
-	local state = {}
-	local drawn = 0
 	local walk = PocketMap.Walk and PocketMap.Walk.session
 	local pvs
 	local frustum = viewFrustum( mini )
@@ -619,10 +778,23 @@ local function drawPass( mini, translucent )
 			end
 		end
 	end
+	local groups = passGroups( mini, pvs )
+	local occlusion = propOcclusion( mini, pvs, frustum )
+	local selected = translucent and groups.translucent or groups.opaque
+	if #selected == 0 then
+		if not translucent then mini.propsDrawn = 0 end
+		return
+	end
+
+	local entity = propEntity( mini )
+	local stamp, entPos, entAng = updateStamp( mini )
+	local state = {}
+	local drawn = 0
 	local context
-	local reuse = translucent and sameCullView( mini.propCullContext, stamp, pvs, frustum )
+	local reuse = sameCullView( mini.propCullContext, stamp, pvs, frustum )
 	if reuse then
 		context = mini.propCullContext
+		context.frame = FrameNumber()
 	elseif not translucent then
 		context = frustum and { frame = FrameNumber(), stamp = stamp, pvs = pvs, frustum = frustum } or nil
 		mini.propCullContext = context
@@ -631,13 +803,14 @@ local function drawPass( mini, translucent )
 	render.SuppressEngineLighting( true )
 	if translucent then render.OverrideDepthEnable( true, false ) end
 
-	for _, group in ipairs( mini.propGroups ) do
-		if not group.sky then drawn = drawn + drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse ) end
+	for i = 1, #selected do
+		drawn = drawn + drawGroup( mini, selected[i], translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse, occlusion )
 	end
 
 	if translucent then render.OverrideDepthEnable( true, true ) end
 	render.SetColorModulation( 1, 1, 1 )
 	render.SuppressEngineLighting( false )
+	traceNextProp( mini, occlusion )
 
 	if not translucent then mini.propsDrawn = drawn end
 end
@@ -655,11 +828,22 @@ local function skyGroupWantsDrawing( group, translucent )
 	return not translucent or group.entTranslucent ~= false
 end
 
-local function anySkyGroupWantsDrawing( groups, translucent )
-	for _, group in ipairs( groups ) do
-		if group.sky and skyGroupWantsDrawing( group, translucent ) then return true end
+local function skyPassGroups( mini )
+	local groups = mini.propGroups
+	local cached = mini.skyPassGroups
+	if cached and cached.source == groups and cached.count == #groups then return cached end
+
+	local opaque, translucent = {}, {}
+	for i = 1, #groups do
+		local group = groups[i]
+		if group.sky then
+			if skyGroupWantsDrawing( group, false ) then opaque[#opaque + 1] = group end
+			if skyGroupWantsDrawing( group, true ) then translucent[#translucent + 1] = group end
+		end
 	end
-	return false
+	cached = { source = groups, count = #groups, opaque = opaque, translucent = translucent }
+	mini.skyPassGroups = cached
+	return cached
 end
 
 local function skyPropMatrix( mini, skyMatrix, p )
@@ -694,23 +878,26 @@ local function drawSkyGroup( mini, group, translucent, skyMatrix, state )
 
 		if parts then
 			cam.PushModelMatrix( matrix )
-			drawParts( parts, translucent )
+			drawParts( parts, translucent, state )
 			cam.PopModelMatrix()
 		else
 			drawEntityProp( entity, state, group, matrix:GetScale().x, p.skin, matrix:GetTranslation(), matrix:GetAngles(), flags )
+			state.material = nil
 		end
 	end
 end
 
 local function drawSkyPass( mini, skyMatrix, translucent )
-	if not anySkyGroupWantsDrawing( mini.propGroups, translucent ) then return end
+	local groups = skyPassGroups( mini )
+	local selected = translucent and groups.translucent or groups.opaque
+	if #selected == 0 then return end
 
 	local state = {}
 	if translucent then render.OverrideDepthEnable( true, false ) end
 	render.SuppressEngineLighting( true )
 
-	for _, group in ipairs( mini.propGroups ) do
-		if group.sky then drawSkyGroup( mini, group, translucent, skyMatrix, state ) end
+	for i = 1, #selected do
+		drawSkyGroup( mini, selected[i], translucent, skyMatrix, state )
 	end
 
 	if translucent then render.OverrideDepthEnable( true, true ) end

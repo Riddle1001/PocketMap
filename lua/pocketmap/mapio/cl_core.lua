@@ -190,6 +190,14 @@ function IO.Rotation(session, record)
 	return session and IO.State(session, record).angles or record.angles
 end
 
+-- Moving entities notify the collision index when their pose changes. Static
+-- doors and brushes then cost nothing to maintain between movement commands.
+function IO.PoseChanged(state, record)
+	state.traceDirty = state.traceDirty or {}
+	state.traceDirty[record] = true
+	state.drawRevision = (state.drawRevision or 0) + 1
+end
+
 function IO.Input(session, target, input, parameter, activator, caller)
 	if not target then return end
 	-- Inputs may also arrive between render hooks (e.g. a use event).
@@ -231,12 +239,43 @@ local function dispatch(session, queued)
 end
 
 -- Hull / bmodel overlap is shared by triggers, buttons and movers.
+-- Prop doors have their own model-space bounds. The brush fallback was centered
+-- on the wrong Z and much thicker than common door models, leaving invisible
+-- collision in the doorway even when the visible door was correctly placed.
+local doorModelBounds = IO.doorModelBounds or {}
+IO.doorModelBounds = doorModelBounds
+
+local function solidModelBounds(record)
+	if record.class ~= "prop_door_rotating" then
+		return record.model and record.model.mins, record.model and record.model.maxs
+	end
+	local path = IO.Value(record.entity, "model")
+	if type(path) ~= "string" or not path:lower():find("%.mdl$") then
+		return Vector(-24, -24, -8), Vector(24, 24, 80)
+	end
+	local key = path:lower()
+	local bounds = doorModelBounds[key]
+	if bounds == nil then
+		bounds = false
+		local model = ClientsideModel(path, RENDERGROUP_OTHER)
+		if IsValid(model) then
+			model:SetNoDraw(true)
+			local mins, maxs = model:GetModelBounds()
+			if mins and maxs and (maxs - mins):LengthSqr() > 1 then
+				bounds = { mins = mins, maxs = maxs }
+			end
+			model:Remove()
+		end
+		doorModelBounds[key] = bounds
+	end
+	if bounds then return bounds.mins, bounds.maxs end
+	return Vector(-24, -24, -8), Vector(24, 24, 80)
+end
+
 function IO.Bounds(record, state)
-	local model = record.model
-	if not model and record.class ~= "prop_door_rotating" then return nil end
+	local mins, maxs = solidModelBounds(record)
+	if not mins then return nil end
 	local offset = IO.Position(state, record)
-	local mins = model and model.mins or Vector(-24, -24, -8)
-	local maxs = model and model.maxs or Vector(24, 24, 80)
 	local angles = IO.Rotation(state, record)
 	if angles.p == 0 and angles.y == 0 and angles.r == 0 then return mins + offset, maxs + offset end
 	-- Rotated brush models use their axis-aligned envelope for fast player traces.
@@ -264,6 +303,20 @@ end
 -- commands advance. Every ground, wall and stair probe shares this index.
 local TRACE_CELL_SIZE = 256
 local TRACE_AXES = { "x", "y", "z" }
+local TRACE_WORLD_AXES = { Vector(1, 0, 0), Vector(0, 1, 0), Vector(0, 0, 1) }
+
+-- An OBB narrow phase keeps the player hull aligned with the map while the
+-- prop door swings. Its AABB is still used for cheap spatial lookup.
+local function doorTraceShape(record, state)
+	if record.class ~= "prop_door_rotating" then return end
+	local mins, maxs = solidModelBounds(record)
+	local origin, angles = IO.Position(state, record), IO.Rotation(state, record)
+	return {
+		center = LocalToWorld((mins + maxs) * 0.5, Angle(), origin, angles),
+		half = (maxs - mins) * 0.5,
+		axes = { angles:Forward(), -angles:Right(), angles:Up() },
+	}
+end
 
 local function traceCells(lo, hi)
 	return math.floor(lo.x / TRACE_CELL_SIZE), math.floor(hi.x / TRACE_CELL_SIZE),
@@ -311,8 +364,8 @@ end
 
 local function traceGrid(session, state)
 	local grid = session.mapIOTraceGrid
-	if not grid or grid.world ~= state.world then
-		grid = { world = state.world, cells = {}, entries = {} }
+	if not grid or grid.world ~= state.world or not grid.byRecord or not grid.hasDoorShapes then
+		grid = { world = state.world, cells = {}, entries = {}, byRecord = {}, hasDoorShapes = true }
 		for _, record in ipairs(state.world.solids) do
 			local handler = IO.classes[record.class]
 			if handler and handler.solid and (handler.solid == true or handler.solid(state, record)) then
@@ -324,26 +377,35 @@ local function traceGrid(session, state)
 				local lo, hi = IO.Bounds(record, state)
 				if lo then
 					setTraceBounds(grid, entry, lo, hi)
+					entry.doorShape = doorTraceShape(record, state)
 					grid.entries[#grid.entries + 1] = entry
+					grid.byRecord[record] = entry
 				end
 			end
 		end
 		session.mapIOTraceGrid = grid
+		state.traceDirty = nil -- initial bounds already include every current pose
 	end
-	if grid.command ~= session.command then
-		grid.command = session.command
-		for _, entry in ipairs(grid.entries) do
-			local record = entry.record
-			local current = state.records[record]
-			local origin = current and current.origin or record.origin
-			local angles = current and current.angles or record.angles
-			if origin.x ~= entry.px or origin.y ~= entry.py or origin.z ~= entry.pz
-				or angles.p ~= entry.pitch or angles.y ~= entry.yaw or angles.r ~= entry.roll then
-				rememberTracePose(entry, origin, angles)
-				local lo, hi = IO.Bounds(record, state)
-				if lo then setTraceBounds(grid, entry, lo, hi) end
+	local dirty = state.traceDirty
+	if dirty then
+		for record in pairs(dirty) do
+			local entry = grid.byRecord[record]
+			if entry then
+				local current = state.records[record]
+				local origin = current and current.origin or record.origin
+				local angles = current and current.angles or record.angles
+				if origin.x ~= entry.px or origin.y ~= entry.py or origin.z ~= entry.pz
+					or angles.p ~= entry.pitch or angles.y ~= entry.yaw or angles.r ~= entry.roll then
+					rememberTracePose(entry, origin, angles)
+					local lo, hi = IO.Bounds(record, state)
+					if lo then
+						setTraceBounds(grid, entry, lo, hi)
+						entry.doorShape = doorTraceShape(record, state)
+					end
+				end
 			end
 		end
+		state.traceDirty = nil
 	end
 	return grid
 end
@@ -384,6 +446,60 @@ local function traceSolid(record, lo, hi, start, finish, mins, maxs, out)
 	end
 end
 
+-- Swept SAT: exact overlap times for the moving, axis-aligned player box and
+-- the rotated door box, including corner contacts. At most 15 separating axes.
+local function traceDoor(record, shape, start, finish, mins, maxs, out)
+	-- Movement traces pass xyz tables; SAT axes still use actual Vectors.
+	local center = Vector(start.x + (mins.x + maxs.x) * 0.5,
+		start.y + (mins.y + maxs.y) * 0.5, start.z + (mins.z + maxs.z) * 0.5)
+	local delta = center - shape.center
+	local motion = Vector(finish.x - start.x, finish.y - start.y, finish.z - start.z)
+	local half = Vector((maxs.x - mins.x) * 0.5, (maxs.y - mins.y) * 0.5,
+		(maxs.z - mins.z) * 0.5)
+	local doorHalf, doorAxes = shape.half, shape.axes
+	local enter, leave = -math.huge, math.huge
+	local normal, normalSign
+	local startsInside, endsInside = true, true
+	local function axisOverlap(axis)
+		local lenSqr = axis:LengthSqr()
+		if lenSqr < 0.00000001 then return true end
+		if math.abs(lenSqr - 1) > 0.000001 then axis = axis / math.sqrt(lenSqr) end
+		local radius = math.abs(axis.x) * half.x + math.abs(axis.y) * half.y + math.abs(axis.z) * half.z
+			+ math.abs(axis:Dot(doorAxes[1])) * doorHalf.x
+			+ math.abs(axis:Dot(doorAxes[2])) * doorHalf.y
+			+ math.abs(axis:Dot(doorAxes[3])) * doorHalf.z
+		local distance = delta:Dot(axis)
+		local speed = motion:Dot(axis)
+		if math.abs(distance) > radius then startsInside = false end
+		if math.abs(distance + speed) > radius then endsInside = false end
+		if math.abs(speed) < 0.000001 then return math.abs(distance) <= radius end
+		local first, last = (-radius - distance) / speed, (radius - distance) / speed
+		if first > last then first, last = last, first end
+		if first > enter then enter, normal, normalSign = first, axis, speed > 0 and -1 or 1 end
+		leave = math.min(leave, last)
+		return enter <= leave
+	end
+	for i = 1, 3 do
+		if not axisOverlap(TRACE_WORLD_AXES[i]) or not axisOverlap(doorAxes[i]) then return end
+	end
+	for i = 1, 3 do
+		for j = 1, 3 do
+			if not axisOverlap(TRACE_WORLD_AXES[i]:Cross(doorAxes[j])) then return end
+		end
+	end
+	if startsInside then
+		out.StartSolid = true
+		if endsInside then
+			out.AllSolid, out.Fraction, out.Entity = true, 0, record
+		end
+	elseif enter >= 0 and enter <= leave and enter < out.Fraction and normal then
+		out.Fraction = math.max(0, enter - 0.0001)
+		out.HitNormal = normal * normalSign
+		out.Entity = record
+		out.Contents = CONTENTS_SOLID or 1
+	end
+end
+
 -- The same local BSP coordinates as Session:TraceHull, without spawning actual entities.
 function IO.Trace(session, start, finish, mins, maxs, out)
 	local state = session.io
@@ -411,7 +527,11 @@ function IO.Trace(session, start, finish, mins, maxs, out)
 							if entry.lo.x <= hiX and entry.hi.x >= loX
 								and entry.lo.y <= hiY and entry.hi.y >= loY
 								and entry.lo.z <= z2 and entry.hi.z >= z1 then
-								traceSolid(entry.record, entry.lo, entry.hi, start, finish, mins, maxs, out)
+								if entry.doorShape then
+									traceDoor(entry.record, entry.doorShape, start, finish, mins, maxs, out)
+								else
+									traceSolid(entry.record, entry.lo, entry.hi, start, finish, mins, maxs, out)
+								end
 							end
 						end
 					end
@@ -465,6 +585,10 @@ end
 local ZERO_ANGLE = Angle()
 local PVS_MAX_RADIUS = 2048
 local PVS_MAX_LEAFS = 128
+local OCCLUSION_MAX_RADIUS = 350
+local OCCLUSION_EYE_DISTANCE = 2
+local cvBrushOcclusion = CreateClientConVar("pocketmap_mapio_occlusion", "1", true, false,
+	"Cull miniature MapIO brushes fully behind static BSP surfaces while the viewer is stationary")
 
 -- Use the same vertices NikNaks puts in its brush meshes: GetVertexs() omits
 -- the bmodel transform applied by GenerateVertexTriangleData(). A missing
@@ -495,6 +619,7 @@ function IO.BuildMeshes(mini, job)
 	mini.dynamicMeshes = {}
 	mini.dynamicOpaque, mini.dynamicTranslucent = {}, {}
 	mini.mapIOPassesSource, mini.mapIODrawCache = mini.dynamicMeshes, nil
+	mini.mapIOMeshWorld = nil
 	for record, faces in pairs(job.dynamicFaces or {}) do
 		local localCenter, radius = brushBounds(faces, record)
 		local builder = NikNaks.MeshBuilder()
@@ -519,6 +644,24 @@ function IO.BuildMeshes(mini, job)
 		if translucent then mini.dynamicTranslucent[#mini.dynamicTranslucent + 1] = item end
 		coroutine.yield()
 	end
+end
+
+-- A new walking session can rebuild its entity records after the miniature's
+-- brush meshes were compiled. Rebind by BSP model index so animations use the
+-- same records as the active I/O session. This runs only when the world changes.
+local function bindMeshRecords(mini, world)
+	if not world or mini.mapIOMeshWorld == world then return end
+	for _, item in ipairs(mini.dynamicMeshes or {}) do
+		local old = item.record
+		local current = old and world.dynamicModels[old.modelIndex]
+		if current and current.class == old.class and current ~= old then
+			item.record = current
+			item.stamp, item.matrixPose = nil, nil
+			item.visibleView, item.checkedPVS, item.clustersChecked = nil, nil, nil
+		end
+	end
+	mini.mapIOMeshWorld = world
+	mini.mapIODrawCache, mini.mapIOOcclusion = nil, nil
 end
 
 -- Existing miniatures can survive Lua auto-refresh. Index their compiled
@@ -656,12 +799,82 @@ local function brushVisible(mini, item, view, pvs, poseChanged, stamp)
 	return visible
 end
 
+-- Tracing the center and the eight expanded bounds corners rejects only brushes
+-- whose entire bounding sphere is well behind the static map. Unknown views,
+-- large models and moving cameras retain the original drawing behavior.
+local function brushBehindWorld(mini, item, eye)
+	if not item.mapCenter or not item.radius or item.radius <= 0 or item.radius > OCCLUSION_MAX_RADIUS then return false end
+	local bsp = mini.bsp
+	local function blocked(target)
+		local trace = bsp:SurfaceTraceLine(eye, target)
+		return trace and trace.Hit and not trace.HitSky and trace.Fraction < 0.95
+	end
+	local center = item.mapCenter
+	if not blocked(center) then return false end
+	local extent = item.radius + 5
+	for x = -1, 1, 2 do for y = -1, 1, 2 do for z = -1, 1, 2 do
+		if not blocked(center + Vector(x * extent, y * extent, z * extent)) then return false end
+	end end end
+	return true
+end
+
+local function brushOcclusion(mini, pvs, view)
+	if not cvBrushOcclusion:GetBool() or not pvs or not view or not mini.bsp.SurfaceTraceLine then return end
+	local eye = (mini.ent:WorldToLocal(view.origin) - mini.boxCenter) / mini.scale + mini.mapCenter
+	local cache = mini.mapIOOcclusion
+	if not cache or cache.meshes ~= mini.dynamicMeshes or cache.bsp ~= mini.bsp then
+		cache = { meshes = mini.dynamicMeshes, bsp = mini.bsp, generation = 0 }
+		mini.mapIOOcclusion = cache
+	end
+	if not cache.eye or cache.pvs ~= pvs or cache.eye:DistToSqr(eye) > OCCLUSION_EYE_DISTANCE ^ 2 then
+		cache.eye, cache.pvs = eye, pvs
+		cache.generation = cache.generation + 1
+		cache.queue, cache.nextIndex, cache.count = {}, 1, 0
+		cache.nextAt = CurTime() + 0.2
+	end
+	return cache
+end
+
+local function brushKnownHidden(item, cache)
+	if not cache or not item.mapCenter or not item.radius or item.radius > OCCLUSION_MAX_RADIUS then return false end
+	if item.occlusionCache == cache and item.occlusionGeneration == cache.generation
+		and item.occlusionPose == item.pose then return item.occludedByWorld end
+	local request = item.occlusionRequest
+	if request and request.pending and request.cache == cache and request.generation == cache.generation then
+		-- Keep one queued job for an animating door; its latest pose wins.
+		request.pose = item.pose
+	else
+		cache.count = cache.count + 1
+		request = { item = item, pose = item.pose, cache = cache, generation = cache.generation, pending = true }
+		cache.queue[cache.count] = request
+		item.occlusionRequest = request
+	end
+	return false
+end
+
+-- One expensive BSP probe per frame. Pose changes invalidate moving doors,
+-- and the view position invalidates cached results when the player walks.
+local function traceNextBrush(mini, cache)
+	if not cache or cache.frame == FrameNumber() or CurTime() < cache.nextAt then return end
+	local index = cache.nextIndex
+	if index > cache.count then return end
+	cache.frame, cache.nextIndex = FrameNumber(), index + 1
+	local queued = cache.queue[index]
+	cache.queue[index] = nil
+	queued.pending = false
+	local item = queued.item
+	if item.pose ~= queued.pose then return end
+	item.occludedByWorld = brushBehindWorld(mini, item, cache.eye)
+	item.occlusionCache, item.occlusionGeneration, item.occlusionPose = cache, cache.generation, item.pose
+end
+
 
 -- Pose, cull and transform once for a matching pair of main-view render
 -- passes. Always prepare afresh for mirrors, water and unknown cameras.
 local function visibleMeshes(mini, state, view, pvs, stamp, opaque, transparent)
 	opaque, transparent = opaque or {}, transparent or {}
 	local records = state and state.records
+	local occlusion = brushOcclusion(mini, pvs, view)
 	-- Reuse the prior main-view lists, retaining their capacity across frames.
 	-- Unknown cameras get independent temporary lists.
 	for i = #opaque, 1, -1 do opaque[i] = nil end
@@ -683,7 +896,7 @@ local function visibleMeshes(mini, state, view, pvs, stamp, opaque, transparent)
 				if item.localCenter then item.mapCenter = LocalToWorld(item.localCenter, ZERO_ANGLE, origin, angles) end
 				item.clustersChecked, item.clusters, item.checkedPVS = nil, nil, nil
 			end
-			if brushVisible(mini, item, view, pvs, poseChanged, stamp) then
+			if brushVisible(mini, item, view, pvs, poseChanged, stamp) and not brushKnownHidden(item, occlusion) then
 				if item.stamp ~= stamp or item.matrixPose ~= item.pose then
 					local matrix = item.matrix
 					matrix:Set(mini.matrix)
@@ -698,12 +911,14 @@ local function visibleMeshes(mini, state, view, pvs, stamp, opaque, transparent)
 			end
 		end
 	end
+	traceNextBrush(mini, occlusion)
 	return opaque, transparent
 end
 
 function IO.Draw(mini, options, translucent)
 	local walk = PocketMap.Walk and PocketMap.Walk.session
 	local state = walk and walk.mini == mini and walk.io
+	bindMeshRecords(mini, state and state.world or mini.mapIO)
 	local pass = passMeshes(mini, translucent)
 	if #pass > 0 then
 		local view = not (options and (options.ignoreZ or options.lightOnly)) and drawView(mini)
@@ -740,6 +955,7 @@ function IO.Destroy(mini)
 	mini.dynamicMeshes = nil
 	mini.dynamicOpaque, mini.dynamicTranslucent = nil, nil
 	mini.mapIOPassesSource, mini.mapIODrawCache = nil, nil
+	mini.mapIOMeshWorld = nil
 	if IsValid and IsValid(mini.mapIODoorProp) then mini.mapIODoorProp:Remove() end
 	mini.mapIODoorProp = nil
 end

@@ -17,7 +17,7 @@ PocketMap adds one entity, a block called **Pocket Map**. Pick a map and it is r
 It is a proof of concept for what [NikNaks](https://github.com/Nak2/NikNaks) can parse out of a `.bsp`.
 
 > [!WARNING]
-> This **will have bugs**. No entity logic is parsed, so doors, buttons, triggers and lights don't work. You can walk around in the map, but the map itself is static. Dynamic prop entities and moving brushes are not solid.
+> This **will have bugs**. Common teleports, doors, buttons, movers and lights are simulated on the client. Other map entity logic may behave differently from the original map.
 
 ## Features
 
@@ -35,6 +35,7 @@ Spawn the entity from the **Entities** tab of the spawn menu, under **Fun + Game
 You start at a random player spawn of the map. Your noclip key (default V) or `pocketmap_noclip` toggles flight, and flying out of the block ends the walk. Your camera moves through the map and your real player stays in the main world.
 
 - **Collision:** brushes, displacements, ladders, water and static props (from their `.phy` files).
+- **Respawning:** dying during a walk keeps you in the miniature. When your player respawns, you restart at a clear map spawn inside the same block.
 - **Movement:** it reads the server's movement ConVars, such as `sv_airaccelerate`, and runs the gamemode's `SetupMove`, `Move` and `FinishMove` hooks, including Sandbox's jump boost. (Clientside)
 - **Other players:** your position, angles and velocity are sent to the server, which relays them to players near it. They will see a tiny version of you within the map.
 
