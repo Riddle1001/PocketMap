@@ -1,4 +1,4 @@
--- Mount the selected BSP's embedded materials and models before the engine first loads them.
+-- Mount the selected BSP's embedded render assets before the engine loads them.
 PocketMap.Pak = {}
 local Pak = PocketMap.Pak
 local mounted = {}
@@ -135,7 +135,7 @@ local MAX_ENTRY_BYTES = 134217728
 local MAX_TOTAL_BYTES = 268435456
 local MAX_ENTRIES = 8192
 -- Bump when the asset selection changes: mounted GMAs stay cached by filename.
-local ASSET_FORMAT_VERSION = 2
+local ASSET_FORMAT_VERSION = 3
 
 local function isNewSafeAssetPath(name)
 	if name:find("..", 1, true) or name:find(":", 1, true) or name:find("%c") then return false end
@@ -149,6 +149,8 @@ local function isNewSafeAssetPath(name)
 			or name:match("%.vtx$") ~= nil or name:match("%.phy$") ~= nil
 			or name:match("%.ani$") ~= nil
 	end
+	if name:match("^particles/.*%.pcf$") then return true end
+	if name:match("^maps/[^/]+_particles%.txt$") then return true end
 	return false
 end
 

@@ -174,20 +174,45 @@ end
 
 ---The reflection and refraction of the water are a second and third draw of the map, so they only get the opaque world:
 ---no props, plants or glass, which is most of the cost of a draw.
-local function drawWorld( mini, options, translucent )
+local sourceWorldMatrix = Matrix()
+
+-- World shaders sample cubemaps with source-map directions and expect unit
+-- tangent frames. A scaled/rotated model matrix changes both. Rebase the camera
+-- instead, preserving the parent projection's depth so the flashlight and props
+-- can still be drawn in miniature space afterwards.
+local function beginSourceWorld( mini, options )
+	local walk = PocketMap.Walk and PocketMap.Walk.session
+	if not walk or walk.mini ~= mini or not options.lightmap or options.flashlight or Water.pass or render.GetRenderTarget() then return false end
+	local view = render.GetViewSetup()
+	if not view or view.ortho or view.offcenter or view.subrect or not view.fov
+		or not view.znear or not view.zfar or not mini.scale or mini.scale <= 0 then return false end
+	local eye = ( mini.ent:WorldToLocal( EyePos() ) - mini.boxCenter ) / mini.scale + mini.mapCenter
+	local angles = mini.ent:WorldToLocalAngles( EyeAngles() )
+	cam.Start3D( eye, angles, view.fov, view.x, view.y, view.width, view.height,
+		view.znear / mini.scale, view.zfar / mini.scale )
+	return true
+end
+
+local function drawWorld( mini, options, translucent, depthOnly )
 	local objects = mini.objects
 	local meshes = translucent and objects.translucentMeshes or objects.opaqueMeshes
 	local batched = meshes and ( options.lightmap or options.flashlight ) and not options.lightOnly and not options.ignoreZ
 	if batched and #meshes == 0 then return end
 	if not batched and #objects == 0 then return end
 
-	cam.PushModelMatrix( mini.matrix )
+	-- Culling uses the parent camera, before entering source coordinates.
+	local view = batched and worldView( mini )
+	local pvs = batched and worldPVS( mini, view )
+	local sourceView = not translucent and not depthOnly and beginSourceWorld( mini, options )
+	local materialScale = sourceView and 1 or mini.scale
+	-- Leave room for the following miniature-space depth pass. Its projection
+	-- must exactly match the flashlight receiver pass, including float rounding.
+	if sourceView then render.DepthRange( 0.01, 1 ) end
+	cam.PushModelMatrix( sourceView and sourceWorldMatrix or mini.matrix )
 	local ok, err = pcall( function()
 	if batched then
 		-- One matrix and lightmap binding for all material slices of the static world.
 		-- The ordering of the meshes within each pass stays the same as MeshBuilder's.
-		local view = worldView( mini )
-		local pvs = worldPVS( mini, view )
 		local visible = worldFrustumParts( mini, meshes, pvs, translucent, view )
 		local candidates = visible or worldPVSCandidates( mini, meshes, pvs, translucent )
 		if translucent then render.OverrideDepthEnable( true, false ) end
@@ -198,7 +223,7 @@ local function drawWorld( mini, options, translucent )
 			local part = candidates[i]
 			if visible or worldPartVisible( part, view ) then
 				if part.material ~= lastMaterial then
-					render.SetMaterial( PocketMap.Materials.ForScale(part.material, mini.scale) )
+					render.SetMaterial( PocketMap.Materials.ForScale(part.material, materialScale) )
 					lastMaterial = part.material
 				end
 				part.mesh:Draw()
@@ -213,7 +238,7 @@ local function drawWorld( mini, options, translucent )
 		if translucent then render.OverrideDepthEnable( false ) end
 	else
 		-- Older loaded miniatures and maps without a lightmap use NikNaks' original drawing path.
-		local drawOptions = PocketMap.Materials.DrawOptions(options, mini.scale)
+		local drawOptions = PocketMap.Materials.DrawOptions(options, materialScale)
 		for i = 1, #objects do
 			if translucent then objects[i]:DrawTranslucent( nil, drawOptions )
 			else objects[i]:DrawOpaque( nil, drawOptions ) end
@@ -221,7 +246,17 @@ local function drawWorld( mini, options, translucent )
 	end
 	end )
 	cam.PopModelMatrix()
+	if sourceView then cam.End3D() end
+	if sourceView then render.DepthRange( 0, 1 ) end
 	if not ok then error( err, 0 ) end
+	if sourceView then
+		render.OverrideColorWriteEnable( true, false )
+		render.OverrideAlphaWriteEnable( true, false )
+		local depthOK, depthError = pcall( drawWorld, mini, options, false, true )
+		render.OverrideColorWriteEnable( false )
+		render.OverrideAlphaWriteEnable( false )
+		if not depthOK then error( depthError, 0 ) end
+	end
 end
 
 local flashlightOptions = { light = false, fullbright = false, flashlight = true }

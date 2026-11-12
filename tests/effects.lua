@@ -5,6 +5,7 @@ function vec.__add(a,b) return Vector(a.x+b.x,a.y+b.y,a.z+b.z) end
 function vec.__sub(a,b) return Vector(a.x-b.x,a.y-b.y,a.z-b.z) end
 function vec.__mul(a,b) return Vector(a.x*b,a.y*b,a.z*b) end
 function vec.__div(a,b) return a*(1/b) end
+function vec.__unm(a)return a*-1 end
 function isvector(v) return getmetatable(v)==vec end
 function Angle() return {Right=function()return Vector(0,-1,0)end,Forward=function()return Vector(1,0,0)end,Up=function()return Vector(0,0,1)end} end
 function Color(r,g,b) return {r=r,g=g,b=b,color=true} end
@@ -25,13 +26,19 @@ function CurTime() return now end
 function FrameNumber() return frame end
 local callbacks,classes,particles,emitters={},{},{},{}
 hook={Add=function(event,_,fn) callbacks[event]=fn end}
-game={AddParticles=function(path)assert(path=='particles/fire_01.pcf')end}
+local particleFiles={}
+game={AddParticles=function(path)particleFiles[#particleFiles+1]=path end,GetMap=function()return 'native_map'end}
+file={Read=function()return ''end,Exists=function()return true end}
 function PrecacheParticleSystem() end
 function CreateParticleSystemNoEntity(name,origin)
     local p={name=name,origin=origin,draws=0}
     function p:SetShouldDraw(v) assert(v==false) self.manual=true end
     function p:Render() assert(self.manual) self.draws=self.draws+1 end
-    function p:StopEmission(_,remove) assert(remove) self.removed=true end
+    function p:StopEmission(_,remove) self.stopped=true if remove then self.removed=true end end
+    function p:StartEmission()self.stopped=false end
+    function p:SetControlPoint(i,pos)self.points=self.points or{}self.points[i]=pos end
+    function p:SetControlPointOrientation(i,f,r,u)self.orientation={i,f,r,u}end
+    function p:SetControlPointParent(i,parent)self.parents=self.parents or{}self.parents[i]=parent end
     particles[#particles+1]=p return p
 end
 function ParticleEmitter()
@@ -65,6 +72,8 @@ function IO.Vector(v) return isvector(v) and v or nil end
 function IO.Angle(v) return v or Angle() end
 function IO.Register(name,value)classes[name]=value end
 function IO.State(s,r)s.records[r]=s.records[r]or{enabled=r.enabled}return s.records[r]end
+function IO.Position(s,r)return IO.State(s,r).origin or r.origin end
+function IO.Rotation(s,r)return IO.State(s,r).angles or r.angles end
 PocketMap={Mini={},Active={},MapIO=IO,Entities={Class=function(e)return e.classname end},Walk={}}
 local traces=0
 function PocketMap.Walk.CollisionSession()
@@ -83,7 +92,7 @@ end
 local fire={classname='env_fire',origin=Vector(10,20,30),firesize=16,spawnflags=269}
 local off={classname='env_fire',origin=Vector(10,20,30),spawnflags=1}
 local smoke={classname='env_smokestack',origin=Vector(10,20,30),InitialState=1,rendercolor=Color(42,42,42),Rate=10,roll=0}
-local mini={state='ready',physics=false,scale=.01,mapCenter=Vector(),boxCenter=Vector(),mapIO={byEntity={}}}
+local mini={mapName='arbitrary_map',state='ready',physics=false,scale=.01,mapCenter=Vector(),boxCenter=Vector(),mapIO={byEntity={}}}
 mini.ent={WorldToLocal=function(_,p)return p-Vector(100,200,300)end,WorldToLocalAngles=function(_,a)return a end}
 mini.bsp={PointInLeaf=function()return {cluster=1}end}
 function mini:BlockPosition(p)return p*self.scale end
@@ -116,3 +125,41 @@ assert(#particles==2 and traces==1,'restarted fire lost its cached placement')
 E.Destroy(mini) E.Destroy(mini)
 assert(particles[2].removed and emitters[1].removed and mini.effectsView==nil,'effect resources survived miniature cleanup')
 print('PASS effects: native fire selection, start flags, source traces/camera/depth, deferred rendering, smoke settings, inputs, cleanup')
+
+local manifest=E.ManifestFiles([[// quoted/unquoted and repeated keys, not a particular map or effect
+"particles_manifest" { "file" "particles/a.pcf" file "!particles/b.pcf" file "particles/a.pcf"
+file "../lua/unsafe.pcf" file "particles/c.txt" }]])
+assert(#manifest==2 and manifest[1]=='particles/a.pcf' and manifest[2]=='particles/b.pcf','manifest entries lost, duplicated or unsafe')
+file.Read=function(name)if name=='maps/arbitrary_map_particles.txt'then return 'map {file "particles/custom.pcf"}'end return '' end
+E.LoadManifests(mini)E.LoadManifests(mini)
+local loaded=0 for _,p in ipairs(particleFiles)do if p=='particles/custom.pcf'then loaded=loaded+1 end end
+assert(loaded==1,'particle files loaded repeatedly')
+local target={origin=Vector(500,600,700),angles=Angle(),enabled=true}
+local custom={classname='info_particle_system',origin=Vector(10,20,30),effect_name='some_other_addons_effect',start_active=1,cpoint1='target',cpoint1_parent=2}
+mini.mapIO={byEntity={[custom]={origin=custom.origin,angles=Angle(),enabled=true}},names={target={target}}}
+session={world=mini.mapIO,records={}}
+PocketMap.Walk.session={mini=mini,io=session}
+E.Build(mini,{custom})
+frame=5 draw()
+local p=particles[#particles]
+assert(p.name=='some_other_addons_effect' and p.points[1].x==500 and p.parents[1]==2,'generic system or control points not preserved')
+assert(traces==1,'custom particle was given a fire ground trace')
+classes.info_particle_system.stop(session,mini.mapIO.byEntity[custom])
+frame=6 draw()
+assert(p.stopped and not p.removed,'Stop deleted live particles instead of letting them decay')
+classes.info_particle_system.start(session,mini.mapIO.byEntity[custom])
+frame=7 draw()
+assert(not p.stopped,'Start failed to resume particle emission')
+local count=#particles
+p.removed=true
+frame=8 draw()
+assert(#particles==count,'a finished one-shot was restarted every frame')
+classes.info_particle_system.stop(session,mini.mapIO.byEntity[custom])frame=9 draw()
+classes.info_particle_system.start(session,mini.mapIO.byEntity[custom])frame=10 draw()
+p=particles[#particles]
+assert(#particles==count+1 and not p.removed,'a stopped and destroyed effect could not start again')
+classes.info_particle_system.destroyimmediately(session,mini.mapIO.byEntity[custom])
+frame=11 draw()
+assert(p.removed,'DestroyImmediately left particles behind')
+E.Destroy(mini)
+print('PASS generic particles: manifests, arbitrary systems, control points, parenting, start/stop, immediate destruction')

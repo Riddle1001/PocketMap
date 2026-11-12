@@ -5,6 +5,54 @@ PocketMap.Effects = PocketMap.Effects or {}
 local Effects, IO = PocketMap.Effects, PocketMap.MapIO
 local ZERO, DOWN = Vector(), Vector(0, 0, 1024)
 local precached = {}
+Effects.loadedFiles = Effects.loadedFiles or {}
+
+-- Keep repeated "file" keys: KeyValuesToTable normally collapses them. Both
+-- quoted and unquoted manifest keys are used by shipped maps and games.
+function Effects.ManifestFiles(text)
+    local tokens, files, seen, at = {}, {}, {}, 1
+    while at <= #text do
+        local c = text:sub(at, at)
+        if c:match("%s") or c == "{" or c == "}" then at = at + 1
+        elseif text:sub(at, at + 1) == "//" then at = (text:find("\n", at + 2, true) or #text) + 1
+        elseif c == '"' then
+            local ending = text:find('"', at + 1, true)
+            if not ending then break end
+            tokens[#tokens + 1], at = text:sub(at + 1, ending - 1), ending + 1
+        else
+            local word = text:match('^[^%s{}"]+', at)
+            if not word then break end
+            tokens[#tokens + 1], at = word, at + #word
+        end
+    end
+    for i = 1, #tokens - 1 do
+        if tokens[i]:lower() == "file" then
+            local path = tokens[i + 1]:gsub("^!", ""):gsub("\\", "/")
+            if path:lower():match("^particles/.+%.pcf$") and not path:find("..", 1, true) and not seen[path] then
+                files[#files + 1], seen[path] = path, true
+            end
+        end
+    end
+    return files
+end
+
+function Effects.LoadManifests(mini)
+    mini.particleFiles, mini.particleWarnings = {}, {}
+    for _, manifest in ipairs({ "particles/particles_manifest.txt", "maps/" .. mini.mapName .. "_particles.txt" }) do
+        for _, path in ipairs(Effects.ManifestFiles(file.Read(manifest, "GAME") or "")) do
+            if not Effects.loadedFiles[path] then
+                if file.Exists(path, "GAME") then
+                    -- Source already loaded the game's global manifest and the
+                    -- actual map's manifest. Reloading either can invalidate
+                    -- particles that are still running in the native map.
+                    if manifest ~= "particles/particles_manifest.txt" and mini.mapName ~= game.GetMap() then game.AddParticles(path) end
+                    Effects.loadedFiles[path] = true
+                else mini.particleWarnings[path] = "Missing particle file" end
+            end
+            mini.particleFiles[#mini.particleFiles + 1] = path
+        end
+    end
+end
 
 -- C_FireSmoke::Start selects these native systems using height / 36.
 function Effects.FireSystem(entity)
@@ -17,6 +65,7 @@ local function stop(effect)
     if IsValid(effect.particle) then effect.particle:StopEmission(false, true) end
     if IsValid(effect.emitter) then effect.emitter:Finish() end
     effect.particle, effect.emitter, effect.lastUpdate, effect.pending = nil, nil, nil, nil
+    effect.started, effect.stopping = nil, nil
 end
 
 function Effects.Destroy(mini)
@@ -36,9 +85,15 @@ IO.Register("env_smokestack", {
     turnon = function(s, r) setActive(s, r, true) end,
     turnoff = function(s, r) setActive(s, r, false) end,
 })
+IO.Register("info_particle_system", {
+    start = function(s, r) setActive(s, r, true) IO.State(s, r).effectDestroy = nil end,
+    stop = function(s, r) setActive(s, r, false) end,
+    destroyimmediately = function(s, r) setActive(s, r, false) IO.State(s, r).effectDestroy = true end,
+})
 
 function Effects.Build(mini, entities)
     Effects.Destroy(mini)
+    Effects.LoadManifests(mini)
     local effects = {}
     for _, entity in pairs(entities) do
         local class, origin = PocketMap.Entities.Class(entity), IO.Vector(IO.Value(entity, "origin"))
@@ -48,6 +103,20 @@ function Effects.Build(mini, entities)
                 active = bit.band(IO.Number(entity, "spawnflags", 0), 4) ~= 0,
                 drop = bit.band(IO.Number(entity, "spawnflags", 0), 16) == 0,
                 radius = math.max(64, IO.Number(entity, "firesize", 64) * 4) }
+        elseif origin and class == "info_particle_system" then
+            local system = IO.Value(entity, "effect_name")
+            if type(system) == "string" and system ~= "" then
+                effect = { kind = "particle", system = system,
+                    active = IO.Number(entity, "start_active", 0) ~= 0, radius = 0, controlPoints = {} }
+                for point = 1, 63 do
+                    local name = IO.Value(entity, "cpoint" .. point)
+                    local records = type(name) == "string" and mini.mapIO and mini.mapIO.names and mini.mapIO.names[name:lower()]
+                    local parent = IO.Number(entity, "cpoint" .. point .. "_parent", 0)
+                    if records and records[1] or parent > 0 then
+                        effect.controlPoints[point] = { record = records and records[1], parent = parent }
+                    end
+                end
+            end
         elseif origin and class == "env_smokestack" then
             local value = IsColor(entity.rendercolor) and entity.rendercolor or IO.Value(entity, "rendercolor")
             local color = IsColor(value) and Vector(value.r, value.g, value.b) or IO.Vector(value) or Vector(255, 255, 255)
@@ -83,8 +152,8 @@ local function isActive(mini, effect)
     local record = state and state.world.byEntity[effect.entity] or effect.record
     local current = state and record and state.records[record]
     if current then
-        if not current.enabled then return false end
-        if current.effectActive ~= nil then return current.effectActive end
+        if not current.enabled then return false, current end
+        if current.effectActive ~= nil then return current.effectActive, current end
     end
     return (not record or record.enabled) and effect.active
 end
@@ -104,14 +173,42 @@ local function fireOrigin(mini, effect)
     return effect.dropped
 end
 
-local function drawFire(mini, effect)
-    local origin = fireOrigin(mini, effect)
+local function drawParticle(mini, effect, active)
+    local origin = effect.kind == "fire" and fireOrigin(mini, effect) or effect.origin
     if not origin then return end
-    if not IsValid(effect.particle) then
+    if not IsValid(effect.particle) and active and not effect.started then
         if not precached[effect.system] then PrecacheParticleSystem(effect.system) precached[effect.system] = true end
         effect.particle = CreateParticleSystemNoEntity(effect.system, origin, effect.angles)
-        if not IsValid(effect.particle) then return end
+        effect.started = true
+        if not IsValid(effect.particle) then
+            mini.particleWarnings[effect.system] = "Particle system unavailable"
+            return
+        end
         effect.particle:SetShouldDraw(false)
+        effect.stopping = false
+    end
+    if not IsValid(effect.particle) then return end
+    if effect.kind == "particle" then
+        if not active and not effect.stopping then
+            effect.particle:StopEmission(false, false)
+            effect.stopping = true
+        elseif active and effect.stopping then
+            effect.particle:StartEmission()
+            effect.stopping, effect.started = false, true
+        end
+        local walk = PocketMap.Walk and PocketMap.Walk.session
+        local session = walk and walk.mini == mini and walk.io
+        local function pose(point, record, fallbackOrigin, fallbackAngles)
+            local pos = record and (session and IO.Position(session, record) or record.origin) or fallbackOrigin
+            local angles = record and (session and IO.Rotation(session, record) or record.angles) or fallbackAngles
+            effect.particle:SetControlPoint(point, pos)
+            effect.particle:SetControlPointOrientation(point, angles:Forward(), angles:Right(), angles:Up())
+        end
+        pose(0, effect.record, origin, effect.angles)
+        for point, control in pairs(effect.controlPoints) do
+            if control.record then pose(point, control.record) end
+            if control.parent > 0 then effect.particle:SetControlPointParent(point, control.parent) end
+        end
     end
     effect.particle:Render()
 end
@@ -178,7 +275,15 @@ end
 local function renderEffects(mini, setup)
     local visible = {}
     for _, effect in ipairs(mini.effects or {}) do
-        if not isActive(mini, effect) then stop(effect)
+        local active, current = isActive(mini, effect)
+        if current and current.effectDestroy then stop(effect) current.effectDestroy = nil end
+        effect.renderActive = active
+        if effect.kind == "particle" then
+            if not active then effect.started = false end
+            -- PCFs can emit far from their origin or span several control points.
+            -- Their native bounds, rather than an invented fixed radius, govern them.
+            if active or IsValid(effect.particle) then visible[#visible + 1] = effect end
+        elseif not active then stop(effect)
         elseif (not setup.pvs or not effect.cluster or setup.pvs[effect.cluster])
             and (not setup.view or setup.partVisible(effect, setup.view)) then
             visible[#visible + 1] = effect
@@ -194,7 +299,7 @@ local function renderEffects(mini, setup)
     render.OverrideDepthEnable(true, false)
     local ok, err = pcall(function()
         for _, effect in ipairs(visible) do
-            if effect.kind == "smoke" then drawSmoke(effect) else drawFire(mini, effect) end
+            if effect.kind == "smoke" then drawSmoke(effect) else drawParticle(mini, effect, effect.renderActive) end
         end
     end)
     cam.PopModelMatrix()
@@ -214,7 +319,6 @@ hook.Add("PostDrawTranslucentRenderables", "PocketMap_Effects", function(depth, 
     end
 end)
 
-game.AddParticles("particles/fire_01.pcf")
 -- Auto-refresh releases old emitters before rebuilding their effect records.
 for mini in pairs(PocketMap.Active or {}) do
     if mini.bsp and mini.state == "ready" then Effects.Build(mini, mini.bsp:GetEntities()) end
