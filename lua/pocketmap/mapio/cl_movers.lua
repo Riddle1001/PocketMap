@@ -169,3 +169,91 @@ IO.OnStep( "Movers", function( session, state, dt )
 		end
 	end
 end )
+
+local ROTATE_START_ON, ROTATE_BACKWARDS, ROTATE_Z, ROTATE_X = 1, 2, 4, 8
+local ROTATE_ACCELERATE, ROTATE_NOT_SOLID = 16, 64
+
+local function initializeRotator( state, record, current )
+	local flags = IO.Number( record.entity, "spawnflags", 0 )
+	local maximum = math.abs( IO.Number( record.entity, "maxspeed", 100 ) )
+	local friction = math.abs( IO.Number( record.entity, "fanfriction", 0 ) ) / 100
+	current.rotator = {
+		axis = bit.band( flags, ROTATE_Z ) ~= 0 and "r" or bit.band( flags, ROTATE_X ) ~= 0 and "p" or "y",
+		sign = bit.band( flags, ROTATE_BACKWARDS ) ~= 0 and -1 or 1,
+		maximum = maximum == 0 and 100 or maximum,
+		friction = friction == 0 and 1 or friction,
+		accelerate = bit.band( flags, ROTATE_ACCELERATE ) ~= 0,
+		speed = 0, target = 0, direction = 1,
+		startAt = bit.band( flags, ROTATE_START_ON ) ~= 0 and state.time + 0.2 or nil,
+	}
+end
+
+local function rotatorFor( state, record )
+	local current = IO.State( state, record )
+	if not current.rotator then initializeRotator( state, record, current ) end
+	return current.rotator
+end
+
+local function setRotationSpeed( rotator, fraction )
+	rotator.startAt, rotator.stopAtStart = nil, nil
+	if fraction ~= 0 then rotator.direction = fraction < 0 and -1 or 1 end
+	rotator.target = math.Clamp( fraction, -1, 1 ) * rotator.maximum
+	if not rotator.accelerate then rotator.speed = rotator.target end
+end
+
+IO.DynamicClass( "func_rotating" )
+IO.Register( "func_rotating", {
+	initialize = initializeRotator,
+	solid = function( _, record ) return bit.band( IO.Number( record.entity, "spawnflags", 0 ), ROTATE_NOT_SOLID ) == 0 end,
+	start = function( state, record )
+		local rotator = rotatorFor( state, record )
+		setRotationSpeed( rotator, rotator.direction )
+	end,
+	stop = function( state, record ) setRotationSpeed( rotatorFor( state, record ), 0 ) end,
+	startforward = function( state, record ) setRotationSpeed( rotatorFor( state, record ), 1 ) end,
+	startbackward = function( state, record ) setRotationSpeed( rotatorFor( state, record ), -1 ) end,
+	setspeed = function( state, record, value )
+		local fraction = tonumber( value )
+		if fraction then setRotationSpeed( rotatorFor( state, record ), fraction ) end
+	end,
+	toggle = function( state, record )
+		local rotator = rotatorFor( state, record )
+		setRotationSpeed( rotator, rotator.target ~= 0 and 0 or rotator.direction )
+	end,
+	reverse = function( state, record )
+		local rotator = rotatorFor( state, record )
+		rotator.direction = -rotator.direction
+		setRotationSpeed( rotator, rotator.direction * math.abs( rotator.target ) / rotator.maximum )
+	end,
+	stopatstartpos = function( state, record ) rotatorFor( state, record ).stopAtStart = true end,
+} )
+
+function IO.StepRotatingBrushes( state, dt )
+	for _, record in ipairs( IO.OfClass( state.world, "func_rotating" ) ) do
+		if IO.Enabled( state, record ) then
+			local rotator = rotatorFor( state, record )
+			if rotator.startAt and state.time >= rotator.startAt then setRotationSpeed( rotator, rotator.direction ) end
+			if rotator.speed ~= rotator.target then
+				local slowing = math.abs( rotator.speed ) >= math.abs( rotator.target ) or rotator.speed * rotator.target < 0
+				local rate = rotator.maximum * rotator.friction * ( slowing and 1 or 2 )
+				rotator.speed = math.Approach( rotator.speed, rotator.target, rate * dt )
+			end
+			local delta = rotator.speed * rotator.sign * dt
+			if delta ~= 0 then
+				local current = IO.State( state, record )
+				local axis = rotator.axis
+				local angle = current.angles[axis]
+				local initial = record.angles[axis]
+				local remaining = delta > 0 and ( initial - angle ) % 360 or ( angle - initial ) % 360
+				if rotator.stopAtStart and remaining <= math.abs( delta ) then
+					current.angles[axis] = initial
+					rotator.speed = 0
+					setRotationSpeed( rotator, 0 )
+				else
+					current.angles[axis] = ( angle + delta + 180 ) % 360 - 180
+				end
+				IO.PoseChanged( state, record )
+			end
+		end
+	end
+end

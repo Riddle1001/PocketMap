@@ -110,7 +110,6 @@ do
     local cvStopSpeed                       = GetConVar and GetConVar("sv_stopspeed")
     local cvMaxVelocity                     = GetConVar and GetConVar("sv_maxvelocity")
     local cvNoclipSpeed                     = GetConVar and GetConVar("sv_noclipspeed")
-    local cvNoclipAccelerate                = GetConVar and GetConVar("sv_noclipaccelerate")
     local cvAutoBhop                        = GetConVar and GetConVar("sv_autobunnyhopping")
 
     local function cvar_float(cv, fallback)
@@ -302,7 +301,11 @@ do
     end
 
     local function get_base_velocity(ply)
-        if context then return 0, 0, 0 end
+        if context then
+            local push = context.triggerPush
+            if push then return push.x, push.y, push.z end
+            return 0, 0, 0
+        end
         if ply.GetBaseVelocity then
             local baseVelocity = ply:GetBaseVelocity()
             if baseVelocity then
@@ -1083,40 +1086,82 @@ do
         return true, ox, oy, oz, vx, vy, vz
     end
 
-    local function noclip_move(ply, mv, dt)
+    local function noclip_move(mv, dt)
         local buttons = mv:GetButtons()
-        local speed = player_run_speed(ply) * cvar_float(cvNoclipSpeed, 5)
-        if band(buttons, BTN_SPEED) ~= 0 then speed = speed * 2 end
-        if band(buttons, BTN_DUCK) ~= 0 then speed = speed * 0.5 end
+        local speed = 100 * cvar_float(cvNoclipSpeed, 5)
+        if band(buttons, BTN_SPEED) ~= 0 then speed = speed * 3 end
+        if band(buttons, BTN_DUCK) ~= 0 then speed = speed * 0.1 end
+
+        -- Garry's Mod normalizes each input direction before combining them.
         local fx, fy, fz, rx, ry, rz = angle_vectors(mv:GetAngles())
-        local forward, side, up = mv:GetForwardSpeed(), mv:GetSideSpeed(), mv:GetUpSpeed()
-        if band(buttons, BTN_JUMP) ~= 0 then up = up + player_run_speed(ply) end
-        local wx, wy, wz, wishSpeed = normalize_3d(fx * forward + rx * side, fy * forward + ry * side, fz * forward + rz * side + up)
-        wishSpeed = min(wishSpeed / max(player_run_speed(ply), 1), 1) * speed
+        local forward, side = mv:GetForwardSpeed(), mv:GetSideSpeed()
+        if forward ~= 0 then forward = forward / abs(forward) end
+        if side ~= 0 then side = side / abs(side) end
+        local up = band(buttons, BTN_JUMP) ~= 0 and 1 or 0
+        local dx, dy, dz = normalize_3d(fx * forward + rx * side, fy * forward + ry * side, fz * forward + rz * side + up)
+
         local vel = mv:GetVelocity()
-        local length = sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z)
-        local friction = length > 0 and max(0, length - max(length, speed * 0.25) * 4 * dt) / length or 0
-        local vx, vy, vz = vel.x * friction, vel.y * friction, vel.z * friction
-        vx, vy, vz = accelerate_3d(vx, vy, vz, wx, wy, wz, wishSpeed, cvar_float(cvNoclipAccelerate, 5), dt, 1)
+        vel.x, vel.y, vel.z = dx * speed, dy * speed, dz * speed
         local origin = mv:GetOrigin()
-        origin.x, origin.y, origin.z = origin.x + vx * dt, origin.y + vy * dt, origin.z + vz * dt
-        vel.x, vel.y, vel.z = vx, vy, vz
+        origin.x, origin.y, origin.z = origin.x + vel.x * dt, origin.y + vel.y * dt, origin.z + vel.z * dt
         mv:SetOrigin(origin)
         mv:SetVelocity(vel)
+    end
+
+    local function update_duck(ply, session, st, buttons, dt, ox, oy, oz)
+        local ducking = session.ducking == true
+        local target = band(buttons, BTN_DUCK) ~= 0
+        local airborne = not session.onground and not st.onladder and session.waterLevel < 2
+        local x, y, z = ox, oy, oz
+
+        if target ~= ducking and (airborne or not target) then
+            local mins, maxs = PocketMap.Movement.PlayerHull(ply, target)
+            if airborne then
+                -- Keep the top of the hull in place when tucking or extending the legs.
+                local oldMins, oldMaxs = PocketMap.Movement.PlayerHull(ply, ducking)
+                x = ox + (oldMaxs.x - oldMins.x) - (maxs.x - mins.x)
+                y = oy + (oldMaxs.y - oldMins.y) - (maxs.y - mins.y)
+                z = oz + (oldMaxs.z - oldMins.z) - (maxs.z - mins.z)
+            end
+
+            -- Check the tucked hull at its new origin. For unduck, sweep the
+            -- standing hull down to the new origin to check clearance.
+            local sx, sy, sz = ox, oy, oz
+            if target then sx, sy, sz = x, y, z end
+            local trace = trace_hull(ply, sx, sy, sz, x, y, z, mins, maxs, MASK_PLAYERSOLID_L, st.traceDuck)
+            if tr_startsolid(trace) or tr_allsolid(trace) or tr_hit(trace) then
+                target = ducking
+            end
+        end
+
+        if target ~= session.duckTarget then st.duckTime = 0 end
+        if target ~= ducking then
+            local duration = target and ply:GetDuckSpeed() or ply:GetUnDuckSpeed()
+            if airborne or st.duckTime >= duration then
+                ducking = target
+                ox, oy, oz = x, y, z
+            end
+            st.duckTime = st.duckTime + dt
+        else
+            st.duckTime = 0
+        end
+
+        session.duckTarget = target
+        session.ducking, session.crouchFlag = ducking, ducking
+        session.duckViewInstant = airborne
+        return ox, oy, oz
     end
 
     -- Establish the virtual player state before gamemode SetupMove callbacks.
     function PocketMap.Movement.Prepare(ply, mv, session)
         context = session
         local st = states[session]
-        -- Use the completed collision state during the view transition.
-        session.ducking = session.crouchFlag == true or (st and st.ducking) or false
         session.onground = false
         session.onladder = st ~= nil and st.onladder == true
         local pos, vel = mv:GetOrigin(), mv:GetVelocity()
         local mins, maxs = PocketMap.Movement.PlayerHull(ply, session.ducking)
         session.waterLevel, session.waterType = cheap_water_level(ply, pos.x, pos.y, pos.z, mins, maxs)
-        if not session.noclip and vel.z <= NON_JUMP_VELOCITY then
+        if not session.noclip and not session.triggerPushLift and vel.z <= NON_JUMP_VELOCITY then
             local dist = st and st.onground and vel.z <= 0 and player_step_size(ply) or GROUND_SNAP
             session.onground = probe_ground(ply, pos.x, pos.y, pos.z, mins, maxs, dist, {})
         end
@@ -1147,7 +1192,9 @@ do
 
         if session.noclip then
             states[session] = nil
-            noclip_move(ply, mv, dt)
+            session.ducking, session.duckTarget, session.crouchFlag = false, false, false
+            session.duckViewInstant = false
+            noclip_move(mv, dt)
             return true
         end
 
@@ -1155,7 +1202,7 @@ do
         if not st then
             st = {
                 onground = false,
-                ducking = false,
+                duckTime = 0,
                 wasJump = false,
                 surfaceFriction = 1,
                 onladder = false,
@@ -1214,33 +1261,13 @@ do
 
         local vx, vy, vz = vel.x, vel.y, vel.z
         local ox, oy, oz = origin.x, origin.y, origin.z
+        local pushLift = session.triggerPushLift
+        session.triggerPushLift = nil
 
         local bvx, bvy, bvz = get_base_velocity(ply)
 
-        local wantDuck = band(buttons, BTN_DUCK) ~= 0
-        local standBlocked = false
-        if not wantDuck and (st.ducking or session.duckTarget) then
-            local standMins, standMaxs = PocketMap.Movement.PlayerHull(ply, false)
-            local standTr = trace_hull(
-                ply,
-                ox, oy, oz,
-                ox, oy, oz,
-                standMins,
-                standMaxs,
-                MASK_PLAYERSOLID_L,
-                st.traceDuck
-            )
-
-            standBlocked = tr_startsolid(standTr) or tr_allsolid(standTr) or tr_hit(standTr)
-        end
-
-        session.duckTarget = wantDuck or standBlocked
-        if CLIENT and PocketMap.Walk and PocketMap.Walk.EyeOffset then
-            PocketMap.Walk.EyeOffset(session)
-        end
-        local ducking = session.crouchFlag == true or standBlocked
-        st.ducking = ducking
-        session.ducking = ducking
+        ox, oy, oz = update_duck(ply, session, st, buttons, dt, ox, oy, oz)
+        local ducking = session.ducking
         local mins, maxs = PocketMap.Movement.PlayerHull(ply, ducking)
         local stepHeight = player_step_size(ply)
 
@@ -1358,7 +1385,10 @@ do
         local groundTrace = nil
         local surfaceFriction = st.surfaceFriction or 1
 
-        if vz <= NON_JUMP_VELOCITY then
+        -- Source consumes vertical base velocity as acceleration during
+        -- gravity. Horizontal base velocity stays in the collision sweep.
+        vz, bvz = vz + bvz * dt, 0
+        if not pushLift and vz <= NON_JUMP_VELOCITY then
             -- One-truth ground state: the pre-jump ground probe must be allowed to recover
             -- the same groundedness that the later snap/down-step path would recover anyway.
             -- Otherwise walking/friction can feel grounded while the jump gate saw airborne.
@@ -1381,7 +1411,7 @@ do
         -- This is the single authoritative ground state for jump/friction/basevelocity.
         if onground and trace_is_ground(groundTrace) then
             onground, groundTrace = publish_ground_truth(ply, st, true, groundTrace)
-            bvx, bvy, bvz = get_base_velocity(ply)
+            bvx, bvy = get_base_velocity(ply)
         else
             onground, groundTrace = clear_ground_truth(ply, st)
         end
@@ -1401,10 +1431,12 @@ do
         if onground and wantsJump then
             clear_ground_truth(ply, st)
 
-            -- Native Source movement consumes half of the first gravity tick
-            -- when jumping. Without it, identical GetJumpPower values produce
-            -- a jump apex about 1.5 units higher at 600 gravity / 66 ticks.
-            vz = player_jump_power(ply) - cvar_float(cvGravity, GRAVITY_FALLBACK) * entity_gravity(ply) * dt * 0.5
+            vz = player_jump_power(ply)
+            -- A crouch jump replaces the vertical velocity, including the
+            -- first half-gravity step that a standing jump carries forward.
+            if not session.duckTarget and not ducking then
+                vz = vz - cvar_float(cvGravity, GRAVITY_FALLBACK) * entity_gravity(ply) * dt * 0.5
+            end
             onground = false
             groundTrace = nil
             jumped = true

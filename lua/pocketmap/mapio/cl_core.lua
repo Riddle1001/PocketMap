@@ -112,7 +112,7 @@ end
 function IO.Build( mini, entities )
 	local world = {
 		entities = {}, names = {}, byClass = {}, byEntity = {},
-		dynamicModels = {}, solids = {}, useTargets = {},
+		dynamicModels = {}, solids = {}, useTargets = {}, triggerChildren = {},
 		registrationVersion = IO.registrationVersion
 	}
 	local models = mini.bsp:GetBModels()
@@ -139,6 +139,21 @@ function IO.Build( mini, entities )
 		if record.name then
 			world.names[record.name] = world.names[record.name] or {}
 			table.insert( world.names[record.name], record )
+		end
+	end
+	for _, class in ipairs( { "trigger_teleport", "trigger_multiple", "trigger_push" } ) do
+		for _, record in ipairs( world.byClass[class] or EMPTY ) do
+			local name = IO.Value( record.entity, "parentname" )
+			local parents = type( name ) == "string" and world.names[string.Trim( name ):lower()]
+			for _, parent in ipairs( parents or EMPTY ) do
+				if IO.dynamic[parent.class] then
+					local origin, angles = WorldToLocal( record.origin, record.angles, parent.origin, parent.angles )
+					local children = world.triggerChildren[parent] or {}
+					children[#children + 1] = { record = record, origin = origin, angles = angles }
+					world.triggerChildren[parent] = children
+					break
+				end
+			end
 		end
 	end
 	mini.mapIO = world
@@ -212,6 +227,13 @@ function IO.PoseChanged( session, record )
 	session.traceDirty = session.traceDirty or {}
 	session.traceDirty[record] = true
 	session.drawRevision = ( session.drawRevision or 0 ) + 1
+	local children = session.world and session.world.triggerChildren
+	if not children or not children[record] then return end
+	local origin, angles = IO.Position( session, record ), IO.Rotation( session, record )
+	for _, link in ipairs( children[record] ) do
+		local child = IO.State( session, link.record )
+		child.origin, child.angles = LocalToWorld( link.origin, link.angles, origin, angles )
+	end
 end
 
 function IO.PlayerHull( session )
@@ -283,7 +305,21 @@ local function dispatch( session, queued )
 	local event, targets = queued.event
 	if event.target == "!self" then targets = { queued.source }
 	elseif event.target == "!caller" then targets = { queued.caller }
-	elseif event.target == "!activator" or event.target == "!player" then targets = { queued.activator }
+	elseif event.target == "!activator" or event.target == "!player" then
+		if queued.activator == session.activator and event.input == "setfogcontroller" and PocketMap.Fog then
+			PocketMap.Fog.Select( session, queued.parameter )
+			return
+		end
+		if queued.activator == session.activator and event.input == "addoutput" then
+			local key, value = queued.parameter:match( "^%s*(%S+)%s+(.+)$" )
+			key = key and key:lower()
+			if key == "targetname" then session.activatorName = string.Trim( value ):lower() end
+			if key == "basevelocity" then
+				local push = IO.Vector( value )
+				if push then session.walker.move.velocity = session.walker.move.velocity + push end
+			end
+		end
+		targets = { queued.activator }
 	else targets = session.world.names[event.target] end
 	for _, target in ipairs( targets or EMPTY ) do
 		IO.Input( session, target, event.input, queued.parameter, queued.activator, queued.caller )
@@ -302,6 +338,8 @@ function IO.Step( session, dt )
 			IO.Fire( state, record, "OnNewGame", state.activator, record )
 		end
 	end
+	-- Sample trigger contact against the same rotation the frame will draw.
+	if IO.StepRotatingBrushes then IO.StepRotatingBrushes( state, dt ) end
 	IO.Use( session, state )
 	for _, callback in ipairs( IO.steps ) do callback( session, state, dt ) end
 	for _ = 1, MAX_EVENTS_PER_STEP do

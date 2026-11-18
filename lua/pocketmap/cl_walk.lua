@@ -13,14 +13,18 @@ function Walk.EyeOffset(session)
 	local ply = LocalPlayer()
 	local standing = ply:GetViewOffset()
 	local ducked = ply:GetViewOffsetDucked()
-	-- The view transition leads the collision-hull switch. Source retains
-	-- the old hull until the duck/unduck animation completes.
 	local target = not session.noclip and session.duckTarget and ducked or standing
 	local now = RealTime()
 	local current = session.viewOffset
 	if not current then
 		current = Vector(standing.x, standing.y, standing.z)
 		session.viewOffset = current
+	end
+
+	if session.duckViewInstant then
+		current.x, current.y, current.z = target.x, target.y, target.z
+		session.viewTarget = nil
+		return current
 	end
 
 	local function progress()
@@ -34,10 +38,6 @@ function Walk.EyeOffset(session)
 		current.x = Lerp(fraction, session.viewFrom.x, session.viewTarget.x)
 		current.y = Lerp(fraction, session.viewFrom.y, session.viewTarget.y)
 		current.z = Lerp(fraction, session.viewFrom.z, session.viewTarget.z)
-		if fraction >= 1 then
-			-- Source's duck flag becomes visible only after the transition ends.
-			session.crouchFlag = session.viewTarget:DistToSqr(ducked) < 0.001
-		end
 	end
 
 	if not session.viewTarget or session.viewTarget:DistToSqr(target) > 0.000001 then
@@ -345,6 +345,8 @@ function Walk.ToggleNoclip()
 			chat.AddText("[PocketMap] Move out of the solid geometry before turning noclip off.")
 			return
 		end
+		session.ducking, session.duckTarget, session.crouchFlag = duck, duck, duck
+		session.duckViewInstant = true
 	end
 	session.noclip = not session.noclip
 	chat.AddText("[PocketMap] Noclip " .. (session.noclip and "on" or "off") .. ".")

@@ -4,8 +4,8 @@ local EMPTY = {}
 
 -- One trigger entity can contain several convex brushes. Its bmodel bounds
 -- enclose the gaps too (surf_ace uses those gaps for drops into later ramps).
-local function triggerBrushes( _, record )
-	if not record.model then return end
+local function triggerBrushes( record )
+	if not record.model or not record.model.GetBrushes then return end
 	local brushes = record.model:GetBrushes()
 	return #brushes > 0 and brushes or nil
 end
@@ -36,11 +36,11 @@ local function rotatedNormals( session, record, brushes, angles )
 	return normals
 end
 
-function IO.TeleportOverlaps( session, record, mins, maxs )
+local function triggerOverlaps( session, record, mins, maxs )
 	if not mins and PocketMap.Movement then mins, maxs = PocketMap.Movement.PlayerHull( LocalPlayer(), session.ducking ) end
 	mins, maxs = mins or Vector( -16, -16, 0 ), maxs or Vector( 16, 16, 72 )
 	if not IO.Overlaps( session, record, mins, maxs ) then return false end
-	local brushes = triggerBrushes( session, record )
+	local brushes = triggerBrushes( record )
 	if not brushes then return true end
 	local origin, angles = IO.Position( session.io, record ), IO.Rotation( session.io, record )
 	local rotated = angles.p ~= 0 or angles.y ~= 0 or angles.r ~= 0
@@ -66,7 +66,55 @@ function IO.TeleportOverlaps( session, record, mins, maxs )
 	return false
 end
 
+IO.TriggerOverlaps = triggerOverlaps
+IO.TeleportOverlaps = triggerOverlaps
+
 IO.Register( "trigger_teleport", {} )
+IO.Register( "trigger_multiple", {} )
+
+function IO.TriggerAllowsPlayer( state, record )
+	local flags = IO.Number( record.entity, "spawnflags", 1 )
+	if bit.band( flags, 65 ) == 0 then return false end
+	local name = IO.Value( record.entity, "filtername" )
+	if type( name ) ~= "string" or name == "" then return true end
+	for _, filter in ipairs( state.world.names[name:lower()] or EMPTY ) do
+		if filter.class == "filter_activator_name" then
+			local expected = IO.Value( filter.entity, "filtername" )
+			local negated = tostring( IO.Value( filter.entity, "Negated" ) or "" ):lower()
+			local deny = negated == "1" or negated:find( "^disallow" ) ~= nil
+			local matches = type( expected ) == "string" and state.activatorName == expected:lower()
+			return matches ~= deny
+		end
+	end
+	-- Preserve the current behavior for filter types the pocket cannot simulate.
+	return true
+end
+
+IO.OnStep( "MultipleTriggers", function( session, state )
+	local mins, maxs
+	for _, record in ipairs( IO.OfClass( state.world, "trigger_multiple" ) ) do
+		if next( record.outputs ) then
+			if not mins then mins, maxs = IO.PlayerHull( session ) end
+			local wasTouching = state.touching[record]
+			local touching = IO.Enabled( state, record ) and IO.TriggerAllowsPlayer( state, record )
+				and IO.TeleportOverlaps( session, record, mins, maxs )
+			if touching then
+				if not wasTouching then IO.Fire( state, record, "OnStartTouch", state.activator, record ) end
+				if record.outputs.ontrigger then
+					local current = IO.State( state, record )
+					if not current.readyAt or state.time >= current.readyAt then
+						local wait = IO.Number( record.entity, "wait", 0.2 )
+						current.readyAt = wait < 0 and math.huge or state.time + ( wait == 0 and 0.2 or wait )
+						IO.Fire( state, record, "OnTrigger", state.activator, record )
+					end
+				end
+			elseif wasTouching then
+				IO.Fire( state, record, "OnEndTouch", state.activator, record )
+			end
+			state.touching[record] = touching or nil
+		end
+	end
+end )
 
 -- Most Hammer teleport brushes never move. Index their immutable BSP bounds
 -- once per map, so a movement command only tests triggers near the player.
@@ -144,18 +192,31 @@ local function destination( state, source )
 	end
 end
 
-local function teleport( session, state, source )
+local function teleport( session, state, source, mins )
 	local target = destination( state, source )
 	if not target then return end
 	local move = session.move
-	local before = move.angles.y
-	move.origin = IO.Position( state, target ) + Vector( 0, 0, 2 )
-	move.velocity = Vector()
-	local angles = IO.Rotation( state, target )
-	move.angles = Angle( angles.p, angles.y, 0 )
-	move.moveAngles = move.angles
-	session.yawOffset = session.yawOffset + angles.y - before
-	session.onground = false
+	local landmarkName = IO.Value( source.entity, "landmark" )
+	local landmarks = type( landmarkName ) == "string" and state.world.names[landmarkName:lower()]
+	local landmark = landmarks and landmarks[1]
+	if landmark then
+		-- Linked tunnel halves are separated in the BSP. Carry the local
+		-- offset, velocity and look direction across the seam unchanged.
+		move.origin = IO.Position( state, target ) + ( move.origin - IO.Position( state, landmark ) )
+	else
+		-- Source aligns the bottom of the player hull to the destination.
+		-- A lift here would put standing players into low ceilings.
+		move.origin = IO.Position( state, target ) - Vector( 0, 0, mins.z )
+		move.velocity = Vector()
+		session.triggerPush, session.triggerPushLift = nil, nil
+		if bit.band( IO.Number( source.entity, "spawnflags", 0 ), 32 ) == 0 then
+			local angles = IO.Rotation( state, target )
+			session.yawOffset = session.yawOffset + angles.y - move.angles.y
+			move.angles = Angle( angles.p, angles.y, 0 )
+			move.moveAngles = move.angles
+		end
+	end
+	session.onground, session.groundRecord = false, nil
 	IO.Fire( state, source, "OnStartTouch", state.activator, source )
 	IO.Fire( state, source, "OnTrigger", state.activator, source )
 end
@@ -171,9 +232,10 @@ IO.OnStep( "Teleports", function( session, state )
 		if record.order > previousOrder then
 			previousOrder = record.order
 			local wasTouching = state.touching[record]
-			local touching = IO.Enabled( state, record ) and IO.TeleportOverlaps( session, record, mins, maxs )
+			local touching = IO.Enabled( state, record ) and IO.TriggerAllowsPlayer( state, record )
+				and IO.TeleportOverlaps( session, record, mins, maxs )
 			if touching and not wasTouching then
-				teleport( session, state, record )
+				teleport( session, state, record, mins )
 				-- Requery after a teleport, but process only later entities this tick.
 				-- This retains BSP entity order without scanning every distant trigger.
 				candidates = teleportCandidates( index, session.move.origin, mins, maxs, state )
