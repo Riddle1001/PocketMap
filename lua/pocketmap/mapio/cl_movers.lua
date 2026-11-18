@@ -24,6 +24,11 @@ local function previousPaths( world )
 	return previous
 end
 
+local function pathInDirection( world, node, forward )
+	if forward then return path( world, IO.Value( node.entity, "target" ) ) end
+	return previousPaths( world )[node]
+end
+
 local function initialize( state, record, current )
 	local linear = record.class == "func_movelinear"
 	local initial = linear and math.Clamp( IO.Number( record.entity, "StartPosition", 0 ), 0, 1 ) or 0
@@ -102,7 +107,7 @@ for _, class in ipairs( MOVERS ) do
 			if not target then return end
 			local mover = setup( state, record )
 			mover.from = target
-			mover.path = mover.forward and path( state.world, IO.Value( target.entity, "target" ) ) or previousPaths( state.world )[target]
+			mover.path = pathInDirection( state.world, target, mover.forward )
 			local origin = IO.Position( state, target )
 			IO.State( state, record ).origin = Vector( origin.x, origin.y, origin.z )
 			IO.PoseChanged( state, record )
@@ -128,7 +133,7 @@ local function moveTrain( state, record, mover, current, dt )
 		IO.Fire( state, target, "OnPass", mover.activator, record )
 		IO.Fire( state, target, "OnTrigger", mover.activator, record )
 		mover.from = target
-		mover.path = mover.forward and path( state.world, IO.Value( target.entity, "target" ) ) or previousPaths( state.world )[target]
+		mover.path = pathInDirection( state.world, target, mover.forward )
 		if not mover.path then
 			mover.active = false
 			IO.Fire( state, record, "OnStop", mover.activator, record )
