@@ -18,13 +18,21 @@ local hintOffset = Vector()
 local hintAngle = Angle( 0, 0, 90 )
 
 function ENT:Initialize()
-	self.LoadedMap = ""
-	self.MapMissing = false
-	self.ExpectedMap = nil
+	if not ( self.Miniature and self.Miniature.entityRefresh ) then
+		self.LoadedMap = ""
+		self.MapMissing = false
+		self.ExpectedMap = nil
+	end
 	self:SetRenderMode( RENDERMODE_TRANSCOLOR )
 end
 
-function ENT:OnRemove()
+function ENT:OnRemove( fullUpdate )
+	-- A full update temporarily removes client entities without deleting their
+	-- server counterparts. Keep the expensive meshes and the virtual player.
+	if fullUpdate and self.Miniature then
+		self.Miniature:BeginEntityRefresh()
+		return
+	end
 	self:DropMiniature()
 end
 
@@ -107,6 +115,7 @@ end
 ---A map this client did not pick: the old miniature is not what the block shows any more, so it is dropped and the hint
 ---asks for E (or says the map is not installed).
 function ENT:FollowMapName( wanted )
+	if self.Miniature and self.Miniature.entityRefresh then return end
 	if wanted == self.LoadedMap then return end
 
 	if self:IsOwnPickArrived( wanted ) then
@@ -118,6 +127,12 @@ function ENT:FollowMapName( wanted )
 end
 
 function ENT:Think()
+	if self.Miniature and self.Miniature.state == "removed" then self:DropMiniature() end
+	if self.Miniature then self.Miniature:UpdateEntityRefresh() end
+	if self.Miniature and self.Miniature.entityRefresh then
+		self:SetNextClientThink( CurTime() + THINK_INTERVAL )
+		return true
+	end
 	local wanted = self:GetMapName()
 
 	self:UpdateThumbnail( wanted )
@@ -153,7 +168,7 @@ end
 
 function ENT:Draw( flags )
 	if isShadowDepthPass( flags ) then
-		if PocketMap.Flashlight then PocketMap.Flashlight.DrawDepth(self.Miniature, flags) end
+		if PocketMap.Flashlight then PocketMap.Flashlight.DrawDepth( self.Miniature, flags ) end
 		return
 	end
 	if halo.RenderedEntity() == self then
@@ -169,7 +184,7 @@ end
 
 function ENT:DrawTranslucent( flags )
 	if isShadowDepthPass( flags ) then
-		if PocketMap.Flashlight then PocketMap.Flashlight.DrawDepth(self.Miniature, flags) end
+		if PocketMap.Flashlight then PocketMap.Flashlight.DrawDepth( self.Miniature, flags ) end
 		return
 	end
 	if halo.RenderedEntity() == self then

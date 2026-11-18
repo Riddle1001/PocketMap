@@ -31,9 +31,13 @@ function angle:Right()
 	return Vector(-math.sin(y), math.cos(y), 0)
 end
 function angle:Up() return Vector(0, 0, 1) end
-function LocalToWorld(pos, _, origin, angles)
+function LocalToWorld(pos, rotation, origin, angles)
 	local y = math.rad(angles.y)
-	return origin + Vector(pos.x * math.cos(y) - pos.y * math.sin(y), pos.x * math.sin(y) + pos.y * math.cos(y), pos.z)
+	return origin + Vector(pos.x * math.cos(y) - pos.y * math.sin(y), pos.x * math.sin(y) + pos.y * math.cos(y), pos.z),
+		Angle(rotation.p + angles.p, rotation.y + angles.y, rotation.r + angles.r)
+end
+function WorldToLocal(pos, rotation, origin, angles)
+	return LocalToWorld(pos - origin, rotation, Vector(), Angle(-angles.p, -angles.y, -angles.r))
 end
 IN_USE = 32
 function math.Clamp(n, a, b) return math.max(a, math.min(b, n)) end
@@ -44,17 +48,37 @@ function CreateClientConVar() return { GetBool = function() return true end } en
 hook = { Add = function() end }
 function ClientsideModel() return nil end
 function IsValid(value) return value ~= nil and value ~= false end
+local player = {}
+function LocalPlayer() return player end
+bit = { band = function(a, b)
+	local result, place = 0, 1
+	while a > 0 and b > 0 do
+		if a % 2 == 1 and b % 2 == 1 then result = result + place end
+		a, b, place = math.floor(a / 2), math.floor(b / 2), place * 2
+	end
+	return result
+end }
+NikNaks = { __metatables = { BSP = {} } }
+dofile("../NikNaks/lua/niknaks/modules/sh_bsp_entities.lua")
+local entityValue = NikNaks.EntityValue
+function NikNaks.EntityValue(entity, key)
+	local value = entity[key]
+	if isvector(value) or isangle(value) then return value end
+	return entityValue(entity, key)
+end
 PocketMap = { Entities = {} }
 function PocketMap.Entities.First(v) return type(v) == "table" and getmetatable(v) == nil and v[1] or v end
 function PocketMap.Entities.Class(ent) return tostring(ent.classname or ""):lower() end
 function PocketMap.Entities.Name(ent) return ent.targetname and ent.targetname:lower() end
 
 dofile("lua/pocketmap/mapio/cl_core.lua")
+dofile("lua/pocketmap/mapio/cl_collision.lua")
 dofile("lua/pocketmap/mapio/cl_teleport.lua")
 dofile("lua/pocketmap/mapio/cl_doors.lua")
 dofile("lua/pocketmap/mapio/cl_buttons.lua")
 dofile("lua/pocketmap/mapio/cl_movers.lua")
 dofile("lua/pocketmap/mapio/cl_conveyor.lua")
+dofile("lua/pocketmap/mapio/cl_logic.lua")
 
 local IO = PocketMap.MapIO
 local models = {
@@ -77,6 +101,131 @@ local function advance(session, ticks)
 end
 
 local tests = {}
+function tests.rotators()
+	local session, state = world({
+		{ classname = "func_rotating", model = "*2", targetname = "panel", maxspeed = 100, spawnflags = 1 },
+		{ classname = "func_rotating", model = "*3", targetname = "fan", origin = Vector(3000, 0, 0),
+			maxspeed = 60, spawnflags = 72 },
+		{ classname = "logic_auto", OnMapSpawn = "fan,Start,,0.1,-1" },
+		{ classname = "trigger_teleport", model = "*2", targetname = "reset", origin = Vector(1024, 0, 0),
+			parentname = "PaNeL", target = "exit", spawnflags = 1 },
+		{ classname = "trigger_push", model = "*2", targetname = "breeze", origin = Vector(128, 0, 0),
+			parentname = "panel", pushdir = "0 0 0", speed = 300, spawnflags = 1 },
+		{ classname = "trigger_multiple", model = "*2", origin = Vector(256, 0, 0),
+			parentname = "panel", spawnflags = 1, OnStartTouch = "relay,Enable,,0,-1" },
+		{ classname = "logic_relay", targetname = "relay", StartDisabled = 1 },
+		{ classname = "info_teleport_destination", targetname = "exit", origin = Vector(4000, 0, 0) },
+	})
+	local panel, fan, reset = state.world.names.panel[1], state.world.names.fan[1], state.world.names.reset[1]
+	assert(state.world.dynamicModels[2] == panel, "rotators must be drawn as movers")
+	assert(IO.classes.func_rotating.solid(state, panel) and not IO.classes.func_rotating.solid(state, fan),
+		"rotator must respect the non-solid flag")
+	advance(session, 2)
+	assert(IO.Rotation(state, panel).y == 0 and IO.Rotation(state, fan).p == 0, "startup delay was ignored")
+	advance(session, 4)
+	assert(IO.Rotation(state, panel).y > 0 and IO.Rotation(state, fan).p > 0, "startup flag or delayed Start failed")
+	local initial = IO.Rotation(state, panel).y
+	IO.Input(state, panel, "SetSpeed", "0.5")
+	advance(session, 2)
+	assert(IO.Rotation(state, panel).y == initial + 5, "SetSpeed must interpret a fraction of maxspeed")
+	IO.Input(state, panel, "Reverse")
+	advance(session, 2)
+	assert(IO.Rotation(state, panel).y == initial, "Reverse must retain speed and reverse direction")
+
+	IO.State(state, panel).angles = Angle(0, 90, 0)
+	IO.PoseChanged(state, panel)
+	IO.Input(state, panel, "Stop")
+	local moved = IO.Position(state, reset)
+	assert(math.abs(moved.x) < 0.001 and moved.y == 1024 and IO.Rotation(state, reset).y == 90,
+		"attached teleport did not rotate around the parent's pivot")
+	session.move.origin = Vector(0, 128, 0)
+	advance(session)
+	assert(session.triggerPush and math.abs(session.triggerPush.y - 300) < 0.001,
+		"attached push did not turn with its parent")
+	session.move.origin = Vector(0, 256, 0)
+	advance(session)
+	assert(IO.Enabled(state, state.world.names.relay[1]), "attached touch trigger did not fire at its new position")
+	session.move.origin = Vector(0, 1024, 0)
+	advance(session)
+	assert(session.move.origin.x == 4000, "attached teleport was missed outside its original spatial cell")
+	print("PASS rotators: authored axis and speed, start timing, inputs, collision flags and attached triggers")
+end
+
+function tests.push()
+	local session, state = world({
+		{ classname = "trigger_push", targetname = "launch", model = "*2", pushdir = "0 180 0", speed = 1250, spawnflags = 1 },
+		{ classname = "trigger_push", targetname = "lift", model = "*2", origin = Vector(0, 200, 0),
+			pushdir = "-90 0 0", speed = 1200, spawnflags = 1, StartDisabled = 1 },
+		{ classname = "trigger_push", model = "*2", origin = Vector(0, 400, 0), pushdir = "0 90 0", speed = 400, spawnflags = 129 },
+	})
+	function session:TraceHull() return { Fraction = 1 } end
+	local move = session.move
+	move.origin, move.velocity = Vector(), Vector()
+	advance(session, 2)
+	assert(math.abs(session.triggerPush.x + 1250) < 0.001 and move.velocity:LengthSqr() == 0,
+		"continuous push must add base velocity without stacking impulses")
+	move.origin = Vector(100, 0, 0)
+	advance(session, 1)
+	local launchSpeed = move.velocity.x
+	assert(not session.triggerPush and math.abs(launchSpeed + 1250 * 1.025) < 0.001,
+		"exiting a push must convert the base velocity to momentum")
+	advance(session, 1)
+	assert(move.velocity.x == launchSpeed, "exit momentum was applied twice")
+
+	move.origin, move.velocity, session.onground = Vector(0, 200, 0), Vector(), true
+	advance(session, 1)
+	assert(not session.triggerPush and session.onground, "disabled push must not detach the player")
+	IO.Input(state, state.world.names.lift[1], "Enable")
+	advance(session, 1)
+	assert(math.abs(session.triggerPush.z - 1200) < 0.001 and not session.onground
+		and session.triggerPushLift and move.origin.z == 1, "vertical push must lift a grounded player")
+	session.noclip = true
+	advance(session, 1)
+	assert(not session.triggerPush and move.velocity:LengthSqr() == 0, "noclip must not retain a push")
+
+	session.noclip = false
+	move.origin = Vector(0, 400, 0)
+	advance(session, 2)
+	assert(math.abs(move.velocity.y - 400) < 0.001 and not session.triggerPush, "one-shot push must fire once")
+	print("PASS push triggers: authored vector, continuous speed, exit momentum, lift, enabled state, noclip and one-shot")
+end
+
+function tests.thin_conveyor()
+	local session, state = world({
+		{ classname = "func_conveyor", model = "*2", targetname = "belt", movedir = "0 0 0", speed = 200 },
+	})
+	local belt = state.world.names.belt[1]
+	function session:TraceHull() return { Fraction = 1 } end
+	session.move.origin, session.onground, session.groundRecord = Vector(0, 0, 80.0625), true, belt
+	advance(session, 1)
+	assert(session.move.origin.x == 10, "grounded hull just above the belt must be carried")
+	session.groundRecord = {}
+	advance(session, 1)
+	assert(session.move.origin.x == 10, "belt must not carry a player grounded on other geometry")
+	print("PASS thin conveyor: grounded trace contact and neighboring ground")
+end
+
+function tests.overlap_cache()
+	local session,state=world({{classname="trigger_teleport",model="*1",origin=Vector()}})
+	local record=IO.OfClass(state.world,"trigger_teleport")[1]
+	session.move.origin=Vector()
+	local original,calls=IO.Bounds,0
+	IO.Bounds=function(...)calls=calls+1 return original(...)end
+	assert(IO.Overlaps(session,record) and IO.Overlaps(session,record) and calls==1,"stationary trigger bounds were rebuilt")
+	local pose=IO.State(state,record)
+	pose.origin=Vector(1000,0,0)
+	assert(not IO.Overlaps(session,record) and calls==2,"moved trigger reused stale bounds")
+	pose.origin.x=2000
+	assert(not IO.Overlaps(session,record) and calls==3,"in-place origin edit reused stale bounds")
+	pose.angles.y=90
+	assert(not IO.Overlaps(session,record) and calls==4,"in-place rotation edit reused stale bounds")
+	local other={io=IO.NewSession(session.mini),move=session.move}
+	assert(IO.Overlaps(other,record) and calls==5,"one session's trigger pose leaked into another")
+	record.model={mins=Vector(3000,0,0),maxs=Vector(3100,10,10)}
+	assert(not IO.Overlaps(other,record) and calls==6,"replaced brush geometry reused stale bounds")
+	IO.Bounds=original
+	print("PASS overlap cache: static reuse, movement, in-place poses, geometry replacement, session isolation")
+end
 function tests.movedir_angles()
 	local session, state = world({
 		{ classname = "func_door", targetname = "vertical", model = "*3", origin = Vector(0, 0, 0),
@@ -156,7 +305,7 @@ function tests.teleport()
 	assert(session.move.origin.x == -100, "teleport occurred outside trigger")
 	session.move.origin = Vector(0, 0, 0)
 	advance(session, 1)
-	assert(session.move.origin.x == 100 and session.move.origin.z == 22, "destination incorrect")
+	assert(session.move.origin.x == 100 and session.move.origin.z == 20, "destination incorrect")
 	assert(session.move.velocity:Length() == 0 and session.yawOffset == 125, "velocity or yaw not reset")
 	assert(IO.Enabled(state, state.world.names.relay[1]), "Source output not dispatched")
 	assert(not IO.Enabled(IO.NewSession({ mapIO = state.world }), state.world.names.relay[1]), "State leaked to next walk")
@@ -169,6 +318,51 @@ function tests.teleport()
 	advance(session, 1)
 	assert(session.move.origin.x == 100, "teleport failed on re-entry")
 	print("PASS teleport: trigger, destination, yaw, velocity, outputs, re-entry")
+end
+
+function tests.teleport_spatial_index()
+	local entities = {}
+	for i = 1, 80 do
+		entities[#entities + 1] = { classname = "trigger_teleport", model = "*1", origin = Vector(i * 1024, 0, 0) }
+	end
+	local session, state = world(entities)
+	session.move.origin = Vector(0, 0, 10)
+	local original, checks = IO.TeleportOverlaps, 0
+	IO.TeleportOverlaps = function(...)
+		checks = checks + 1
+		return original(...)
+	end
+	advance(session, 2)
+	assert(checks == 0 and not state.teleportMutable,
+		"distant immutable triggers were queried on every movement command")
+	local record = IO.OfClass(state.world, "trigger_teleport")[1]
+	local pose = IO.State(state, record)
+	pose.origin = Vector(0, 0, 0)
+	advance(session)
+	assert(state.touching[record] and checks == 1, "session moved trigger was missed outside its indexed cell")
+	pose.origin.x = 4096
+	advance(session)
+	assert(not state.touching[record], "moving trigger did not send the touch exit")
+	pose.origin.x = 0
+	IO.Input(state, record, "Disable")
+	advance(session)
+	assert(not state.touching[record], "disabled moved trigger reported a touch")
+	IO.Input(state, record, "Enable")
+	advance(session)
+	assert(state.touching[record], "re-enabled moved trigger was not queried")
+	IO.TeleportOverlaps = original
+
+	local chained = world({
+		{ classname = "trigger_teleport", model = "*1", origin = Vector(), target = "b" },
+		{ classname = "trigger_teleport", model = "*1", origin = Vector(1024, 0, 0), target = "end" },
+		{ classname = "info_teleport_destination", targetname = "b", origin = Vector(1024, 0, 0) },
+		{ classname = "info_teleport_destination", targetname = "end", origin = Vector(2048, 0, 0) },
+	})
+	chained.move.origin = Vector()
+	advance(chained)
+	assert(chained.move.origin.x == 2048,
+		"teleport into another indexed cell failed to trigger in the same step")
+	print("PASS teleport index: distant broad phase, mutable poses, enable/disable, ordered chains")
 end
 
 local function boxBrush(lo, hi)
@@ -184,14 +378,9 @@ local function boxBrush(lo, hi)
 end
 
 local function triggerWorld(brushes, lo, hi, origin, angles)
-	local model = { mins = lo, maxs = hi, headnode = 0 }
+	local model = { mins = lo, maxs = hi, GetBrushes = function() return brushes end }
 	local bsp = {
 		GetBModels = function() return { [1] = model } end,
-		GetNodes = function() return { [0] = { children = { -1, -2 } } } end,
-		GetLeafs = function() return {
-			[0] = { GetBrushes = function() return brushes end },
-			[1] = { GetBrushes = function() return { brushes[1] } end },
-		} end,
 	}
 	local mini = { bsp = bsp }
 	IO.Build(mini, {
@@ -217,7 +406,6 @@ function tests.surf_ace_drop()
 	assert(IO.Overlaps(session, trigger), "drop fixture must reproduce the old bounding-box reset")
 	advance(session)
 	assert(session.move.origin.x == 3104, "surf_ace drop opening incorrectly reset the walker")
-	assert(#trigger.teleportBrushes == 4, "leaf traversal failed to deduplicate trigger brushes")
 	session.move.origin = Vector(3700, -128, -272)
 	advance(session)
 	assert(session.move.origin.x == 10000, "solid part of surf_ace reset trigger stopped working")
@@ -235,6 +423,24 @@ function tests.teleport_shape_and_hull()
 	assert(IO.Overlaps(session, trigger) and not IO.TeleportOverlaps(session, trigger), "rotated slope triggered in its empty bounding-box corner")
 	session.move.origin = Vector(200, 220, 20)
 	assert(IO.TeleportOverlaps(session, trigger), "rotated sloping brush failed to detect a real touch")
+	local originalLocalToWorld, rotations = LocalToWorld, 0
+	LocalToWorld = function(...) rotations = rotations + 1 return originalLocalToWorld(...) end
+	-- Warm a new angle, then ensure identical rotations reuse the actual brush
+	-- normals even when the player hull is tested every movement step.
+	local pose = IO.State(session.io, trigger)
+	pose.angles = Angle(0, 135, 0)
+	IO.TeleportOverlaps(session, trigger)
+	local first = rotations
+	assert(first >= #brush.sides, "rotated planes were not prepared")
+	IO.TeleportOverlaps(session, trigger)
+	assert(rotations == first, "stationary trigger planes were rotated again")
+	pose.angles.y = 90
+	assert(IO.TeleportOverlaps(session, trigger), "in-place trigger angle change broke collision")
+	assert(rotations > first, "in-place trigger angle change retained stale normals")
+	local second = rotations
+	IO.TeleportOverlaps(session, trigger)
+	assert(rotations == second, "updated trigger angle planes were not reused")
+	LocalToWorld = originalLocalToWorld
 
 	local ceiling = boxBrush(Vector(-100, -100, 60), Vector(100, 100, 80))
 	session = triggerWorld({ ceiling }, Vector(-100, -100, 60), Vector(100, 100, 80), Vector(), Angle())
@@ -356,7 +562,9 @@ function tests.conveyor()
 		{ classname = "logic_relay", targetname = "relay", StartDisabled = 1 },
 	})
 	local belt = state.world.names.belt[1]
-	session.move.origin = Vector(0, 0, 80)
+	session.onground = true
+	function session:TraceHull() return { Fraction = 1 } end
+	session.move.origin = Vector(0, 0, 80.0625)
 	advance(session, 1)
 	assert(session.move.origin.x == 3, "conveyor did not carry walker")
 	assert(IO.Enabled(state, state.world.names.relay[1]), "conveyor touch output missing")

@@ -21,7 +21,7 @@ function ply:SetLocalVelocity(v) self.velocity=v end
 local block={map="test_map"}
 function block:GetMapName() return self.map end
 function block:GetClass() return "ent_pocketmap" end
-function block:NearestPoint(eye) return eye end
+function block:NearestPoint(eye) return Vector(99999,99999,99999) end
 MOVETYPE_NOCLIP=8
 game={GetMap=function()return "test_map" end,SinglePlayer=function()return false end}
 PocketMap={}
@@ -55,13 +55,19 @@ send(false)
 assert(message.mode==0 and ply:EyePos():DistToSqr(request.eye)<0.000001,"native eye position changed")
 assert(ply.angle==request.angle and ply.moveType==MOVETYPE_NOCLIP,"native viewing angle or noclip was lost")
 send(false)
-assert(message.mode==2,"duplicate entry replaced return state")
+assert(message.mode==0 and PocketMap.CompareReturns[ply].position==initialPos,"repeat entry lost the original return position")
 local nativeEye,nativeAngle=Vector(1200,2100,3200),Angle(-20,150,0)
 ply.pos,ply.angle=nativeEye-Vector(0,0,64),nativeAngle
 send(true)
 assert(message.mode==1 and message.eye:DistToSqr(nativeEye)<0.000001 and message.angle==nativeAngle,"return lost the native view")
 assert(ply.pos==initialPos and ply.angle==initialAngles and ply.moveType==2,"return did not restore the real player")
 assert(not PocketMap.CompareReturns[ply],"return state leaked")
+send(false)
+hooks.PlayerDeath(ply)
+assert(not PocketMap.CompareReturns[ply],"death retained comparison state")
+send(false)
+hooks.PlayerSpawn(ply)
+assert(not PocketMap.CompareReturns[ply],"respawn retained comparison state")
 send(false)
 hooks.PlayerDisconnected(ply)
 assert(not PocketMap.CompareReturns[ply],"disconnect retained comparison state")
@@ -94,6 +100,12 @@ assert(sent==1,"pending request was duplicated")
 response={mode=0}
 receivers.PocketMap_Compare()
 assert(not PocketMap.Walk.session and PocketMap.Compare.saved==old and not PocketMap.Compare.pending,"native acknowledgement lost saved session")
+local reentered={mini=mini,io=io,move={origin=Vector(220,330,440),angles=Angle(3,80,0)}}
+PocketMap.Walk.session=reentered
+commands.pocketmap_compare()
+assert(not message.returning and PocketMap.Compare.saved==reentered,"reentering a PocketMap failed to start a fresh comparison")
+response={mode=0}
+receivers.PocketMap_Compare()
 commands.pocketmap_compare()
 assert(message.returning and PocketMap.Compare.pending,"native view failed to request return")
 response={mode=1,eye=Vector(250,350,500),angle=Angle(-10,120,0)}
@@ -104,5 +116,5 @@ assert(resumed.io==io and resumed.io.queue[1]=="door state" and not next(resumed
 assert(not PocketMap.Compare.saved and not PocketMap.Compare.pending and resumed.enteredAt==98,"return did not clear transition state")
 mini.mapName="other_map"
 commands.pocketmap_compare()
-assert(sent==2,"client accepted a mismatched map")
-print("PASS comparison: permission, map matching, finite coordinates, exact native view, return view, body restoration, cleanup")
+assert(sent==3,"client accepted a mismatched map")
+print("PASS comparison: permission, map matching, no block distance restriction, finite coordinates, exact native view, return view, body restoration, cleanup")

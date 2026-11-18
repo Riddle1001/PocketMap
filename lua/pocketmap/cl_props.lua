@@ -8,6 +8,8 @@ local Props = PocketMap.Props
 local Entities = PocketMap.Entities
 
 local STATIC_PROP_USE_LIGHTING_ORIGIN = 2
+local STATIC_PROP_FADES = 1
+local STATIC_PROP_SCREEN_SPACE_FADE = 32
 local RENDERMODE_DONT_RENDER = 10
 local EF_NODRAW = 32
 local MISSING_NAMES_KEPT = 8
@@ -20,13 +22,15 @@ local FRUSTUM_PAD = 4
 local FRUSTUM_FOV_PAD = 3
 local OCCLUSION_PAD = 5
 local OCCLUSION_MAX_RADIUS = 350
-local OCCLUSION_RECHECK_DISTANCE = 2
 local ZERO_ANGLE = Angle()
 
 local cvPropOcclusion = CreateClientConVar( "pocketmap_prop_occlusion", "1", true, false,
 	"Cull miniature props behind solid BSP surfaces while the viewer is stationary" )
 local cvPropFrustumCache = CreateClientConVar( "pocketmap_prop_frustum_cache", "1", true, false,
 	"Reuse prop frustum visibility while the camera and miniature stay still" )
+
+local cvWaterClipBounds = CreateClientConVar( "pocketmap_water_clip_bounds", "1", true, false,
+	"Cache conservative world candidates on each side of a water plane" )
 
 local DRAW_FLAGS = bit.bor( STUDIO_RENDER or 1, STUDIO_DRAWTRANSLUCENTSUBMODELS or 4 )
 local OPAQUE_FLAGS = STUDIO_RENDER or 1
@@ -37,7 +41,7 @@ local function newModelIndex( bsp, skyArea )
 	local index = { byModel = {}, models = {}, animOf = {} }
 
 	---A prop with an animation is a group of its own: the meshes are the reference pose, so it is drawn as an entity posed by the sequence.
-	index.addProp = function( path, origin, angles, skin, propScale, lightOrigin, sky, anim, entityProp )
+	index.addProp = function( path, origin, angles, skin, propScale, lightOrigin, sky, anim, entityProp, fade, clusters, staticIndex )
 		if anim then
 			local key = path .. "\0" .. anim
 			index.animOf[key] = { path, anim }
@@ -51,7 +55,8 @@ local function newModelIndex( bsp, skyArea )
 
 		table.insert( index.byModel[path], {
 			Origin = origin, Angles = angles, Skin = skin, UniformScale = propScale,
-			LightOrigin = lightOrigin, Sky = sky, EntityProp = entityProp,
+			LightOrigin = lightOrigin, Sky = sky, EntityProp = entityProp, Fade = fade, Clusters = clusters,
+			StaticIndex = staticIndex,
 		} )
 	end
 
@@ -70,18 +75,47 @@ local function countProp( mini, sky, counter )
 	if sky then mini.skyProps = ( mini.skyProps or 0 ) + 1 else mini[counter] = mini[counter] + 1 end
 end
 
+local function distanceFade( prop )
+	local flags = prop.Flags or 0
+	if bit.band( flags, STATIC_PROP_FADES + STATIC_PROP_SCREEN_SPACE_FADE ) ~= STATIC_PROP_FADES then return end
+	local first, last = prop.FadeMinDist, prop.FadeMaxDist
+	if not first or not last or last <= 0 then return end
+	return { first = first >= 0 and first * first or -1, last = last * last }
+end
+
+-- Source links each static prop to the leaves compiled into the sprp lump.
+-- In particular, the render bounds of a large prop can span unrelated rooms.
+function Props.StaticClusters( prop, indices, leaves )
+	if not indices or not prop.First_leaf or not prop.LeafCount or prop.LeafCount == 0 then return end
+	local clusters, seen = {}, {}
+	for i = prop.First_leaf, prop.First_leaf + prop.LeafCount - 1 do
+		local leaf = leaves[indices[i]]
+		if not leaf or not leaf.cluster then return end
+		local cluster = leaf.cluster
+		if cluster >= 0 and not seen[cluster] then
+			clusters[#clusters + 1], seen[cluster] = cluster, true
+		end
+	end
+	if #clusters > 0 then return clusters end
+end
+
 local function readStaticProps( mini, job )
 	mini:SetStatus( "Reading the static props", 0.6 )
 	local staticProps = job.bsp:GetStaticProps()
+	local leafIndices = job.bsp.GetStaticPropLeafIndices and job.bsp:GetStaticPropLeafIndices()
+	local leaves = leafIndices and job.bsp:GetLeafs()
 	coroutine.yield()
 
 	for _, prop in pairs( staticProps ) do
 		if prop.PropType then
 			local usesLightingOrigin = prop.Flags and bit.band( prop.Flags, STATIC_PROP_USE_LIGHTING_ORIGIN ) ~= 0
 			local sky = job.inSkyRoomAt( prop.Origin )
-
-			job.addProp( prop.PropType, prop.Origin, prop.Angles, prop.Skin, prop.UniformScale, usesLightingOrigin and prop.LightingOrigin or nil, sky )
-			countProp( mini, sky, "staticCount" )
+			if not PocketMap.Settings or PocketMap.Settings.Enabled( mini, sky and "sky_props" or "static_props" ) then
+				job.addProp( prop.PropType, prop.Origin, prop.Angles, prop.Skin, prop.UniformScale,
+					usesLightingOrigin and prop.LightingOrigin or nil, sky, nil, nil, not sky and distanceFade( prop ) or nil,
+					not sky and Props.StaticClusters( prop, leafIndices, leaves ), prop.Index )
+				countProp( mini, sky, "staticCount" )
+			end
 		end
 	end
 	coroutine.yield()
@@ -141,12 +175,14 @@ local function readEntityProps( mini, job )
 				mini.hiddenEntities = mini.hiddenEntities + 1
 			else
 				local sky = job.inSkyRoomAt( entity.origin )
+				if not PocketMap.Settings or PocketMap.Settings.Enabled( mini, sky and "sky_props" or "entity_props" ) then
 				local lightName = Entities.First( entity.lightingorigin or entity.LightingOrigin )
 				local lightOrigin = type( lightName ) == "string" and lightingOrigins[lightName:lower()] or nil
 				local kind = class:find( "^prop_dynamic" ) and "dynamic" or true
 
 				job.addProp( model, entity.origin, anglesOf( entity ), tonumber( entity.skin ) or 0, tonumber( entity.modelscale ), lightOrigin, sky, animOf( entity ), kind )
 				countProp( mini, sky, "entityCount" )
+				end
 			end
 		end
 	end
@@ -277,7 +313,14 @@ local function propSphere( mini, prop, mins, maxs, blockScale )
 	local mapCenter = LocalToWorld( center, ZERO_ANGLE, prop.Origin, prop.Angles )
 	local radius = ( maxs - mins ):Length() * scale * 0.5 + FRUSTUM_PAD * blockScale
 	if radius >= math.huge or radius ~= radius then return nil end
-	return ( mapCenter - mini.mapCenter ) * blockScale + mini.boxCenter, radius
+	local half = ( maxs - mins ) * ( scale * 0.5 )
+	local forward, right, up = prop.Angles:Forward(), prop.Angles:Right(), prop.Angles:Up()
+	local pad = FRUSTUM_PAD * blockScale
+	local extents = Vector(
+		math.abs( forward.x ) * half.x + math.abs( right.x ) * half.y + math.abs( up.x ) * half.z + pad,
+		math.abs( forward.y ) * half.x + math.abs( right.y ) * half.y + math.abs( up.y ) * half.z + pad,
+		math.abs( forward.z ) * half.x + math.abs( right.z ) * half.y + math.abs( up.z ) * half.z + pad )
+	return ( mapCenter - mini.mapCenter ) * blockScale + mini.boxCenter, radius, extents
 end
 
 ---Props are placed relative to the block, so each frame only needs the block's transform.
@@ -286,29 +329,46 @@ local function newPlacer( mini, job, light )
 
 	return {
 		inBlock = function( prop, mins, maxs, model )
-			local pvsCluster, pvsClusters = propClusters( job.bsp, prop, mins, maxs )
-			local sphereCenter, sphereRadius = propSphere( mini, prop, mins, maxs, scale )
+			local pvsCluster, pvsClusters
+			local compiled = prop.Clusters
+			if not compiled then
+				pvsCluster, pvsClusters = propClusters( job.bsp, prop, mins, maxs )
+			elseif #compiled == 1 then
+				pvsCluster = compiled[1]
+			else
+				pvsClusters = compiled
+			end
+			local sphereCenter, sphereRadius, boxExtents = propSphere( mini, prop, mins, maxs, scale )
 			return {
 				lpos = ( prop.Origin - mini.mapCenter ) * scale + mini.boxCenter,
 				langles = prop.Angles,
 				skin = prop.Skin or 0,
 				lscale = ( prop.UniformScale or 1 ) * scale,
-				light = light:Of( prop, model ),
+				origin = prop.Origin, uscale = prop.UniformScale or 1, fade = prop.Fade,
+				light = light:Of( prop, model, coroutine.yield ),
 				pvsCluster = pvsCluster, pvsClusters = pvsClusters,
-				lcenter = sphereCenter, sphereRadius = sphereRadius,
+				lcenter = sphereCenter, sphereRadius = sphereRadius, boxExtents = boxExtents,
 			}
 		end,
 
 		---A prop of the sky room stays where it is in the sky room: it moves with the skybox.
 		inSkyRoom = function( prop, model )
-			return { origin = prop.Origin, angles = prop.Angles, skin = prop.Skin or 0, uscale = prop.UniformScale or 1, light = light:Of( prop, model ) }
+			return { origin = prop.Origin, angles = prop.Angles, skin = prop.Skin or 0, uscale = prop.UniformScale or 1, light = light:Of( prop, model, coroutine.yield ) }
 		end,
 	}
 end
 
 local function addGroup( mini, group )
+	for _, prop in ipairs( group.props ) do
+		if prop.fade then group.hasFade = true break end
+	end
 	mini.propGroups[#mini.propGroups + 1] = group
 end
+
+-- Keep shared meshes for small and repeated props. Large focal models can
+-- keep their authored gradients within a bounded per-map mesh allocation.
+local VERTEX_LIGHT_BUDGET = 300000
+local MIN_VERTEX_LIT_EXTENT = 512
 
 ---@param props table[] # the props of one model
 local function placeModel( mini, placer, props, path, anim, bakeMeshes )
@@ -329,9 +389,49 @@ local function placeModel( mini, placer, props, path, anim, bakeMeshes )
 	if #keptPosed > 0 then addGroup( mini, { model = path, anim = 0, props = keptPosed } ) end
 	if #kept == 0 and #skyKept == 0 then return end
 
-	local meshes = not anim and bakeMeshes and PocketMap.PropMesh.Build( path ) or nil
-	if #kept > 0 then addGroup( mini, { model = path, anim = anim, props = kept, meshes = meshes } ) end
-	if #skyKept > 0 then addGroup( mini, { model = path, anim = anim, props = skyKept, meshes = meshes, sky = true } ) end
+	local meshesBySkin, vertexOrder = {}, nil
+	local vertexLighting = #props <= 6 and mins and maxs and ( maxs - mins ):LengthSqr() >= MIN_VERTEX_LIT_EXTENT ^ 2
+		and NikNaks.ModelVertexLightingOrder
+	local function placeGroups( list, sky )
+		if #list == 0 then return end
+		if anim or not bakeMeshes then
+			addGroup( mini, { model = path, anim = anim, props = list, sky = sky } )
+			return
+		end
+		-- Baked geometry carries its materials: SetSkin on the reusable entity
+		-- cannot change it. Resolve each skin family when extracting the mesh.
+		local bySkin = {}
+		for _, prop in ipairs( list ) do
+			bySkin[prop.skin] = bySkin[prop.skin] or {}
+			table.insert( bySkin[prop.skin], prop )
+		end
+		for skin, propsForSkin in pairs( bySkin ) do
+			local shared = {}
+			for _, prop in ipairs( propsForSkin ) do
+				local lighting = prop.light.vertexLight
+				local used = mini.vertexLitPropVertices or 0
+				local meshes, vertices
+				if vertexLighting and lighting and lighting.data and used < VERTEX_LIGHT_BUDGET then
+					if vertexOrder == nil then vertexOrder = vertexLighting( path, lighting.checksum, coroutine.yield ) or false end
+					meshes, vertices = PocketMap.PropMesh.BuildWithVertexLighting( path, skin, lighting, vertexOrder,
+						VERTEX_LIGHT_BUDGET - used, coroutine.yield )
+				end
+				if meshes then
+					mini.vertexLitPropVertices = used + vertices
+					addGroup( mini, { model = path, props = { prop }, meshes = meshes, sky = sky } )
+					coroutine.yield()
+				else
+					shared[#shared + 1] = prop
+				end
+			end
+			if #shared > 0 then
+				if meshesBySkin[skin] == nil then meshesBySkin[skin] = PocketMap.PropMesh.Build( path, skin ) or false end
+				addGroup( mini, { model = path, props = shared, meshes = meshesBySkin[skin] or nil, sky = sky } )
+			end
+		end
+	end
+	placeGroups( kept, false )
+	placeGroups( skyKept, true )
 end
 
 local function noteMissingModel( mini, path, count )
@@ -350,10 +450,17 @@ function Props.Place( mini, job, lightToggle, bakeMeshes )
 	mini.propOcclusion = nil
 
 	mini:SetStatus( "Reading the ambient light", 0.645 )
+	local vertexLights
+	if ( mini.staticCount > 0 or ( mini.skyProps or 0 ) > 0 )
+		and ( not PocketMap.Settings or PocketMap.Settings.Enabled( mini, "prop_lighting" ) ) then
+		local ok, result = pcall( PocketMap.Pak.StaticPropLights, bsp, hdr, bsp:GetStaticProps(), coroutine.yield )
+		if ok then vertexLights = result end
+	end
 	PocketMap.PropLight.Prepare( bsp, hdr )
 	coroutine.yield()
 
-	local placer = newPlacer( mini, job, PocketMap.PropLight.New( mini, bsp, lightToggle ) )
+	mini.propLightSampler = PocketMap.PropLight.New( mini, bsp, lightToggle, vertexLights )
+	local placer = newPlacer( mini, job, mini.propLightSampler )
 	local errorProps = {}
 	local errorMins, errorMaxs = modelBounds( mini, "models/error.mdl" )
 
@@ -378,6 +485,7 @@ function Props.Place( mini, job, lightToggle, bakeMeshes )
 	end
 
 	if #errorProps > 0 then addGroup( mini, { model = "models/error.mdl", props = errorProps } ) end
+	for _, light in pairs( vertexLights or {} ) do light.data, light.groups = nil, nil end
 	coroutine.yield()
 end
 
@@ -389,6 +497,15 @@ local function setModelLight( state, light, transform )
 		render.SetLocalModelLights( rendered.direct )
 		state.direct = rendered.direct
 	end
+	if rendered.uniform then
+		local color, previous = rendered.uniform, state.uniform
+		if not previous or previous[1] ~= color[1] or previous[2] ~= color[2] or previous[3] ~= color[3] then
+			render.ResetModelLighting( color[1], color[2], color[3] )
+		end
+		state.light, state.uniform = rendered.cube, color
+		return
+	end
+	state.uniform = nil
 	light = rendered.cube
 	if light == state.light then return end
 	-- Many static props have separately allocated but identical ambient cubes.
@@ -413,11 +530,14 @@ local function setModelLight( state, light, transform )
 	end
 end
 
-local function drawParts( parts, translucent, state )
+-- Moving entity models use the same BSP lighting as static and sky props.
+Props.SetModelLight = setModelLight
+
+local function drawParts( parts, translucent, state, fading )
 	for i = 1, #parts do
 		local part = parts[i]
-		if part.translucent == translucent then
-			local material = state.depth and PocketMap.Flashlight.DepthMaterial(part.material) or part.material
+		if fading or part.translucent == translucent then
+			local material = state.depth and PocketMap.Flashlight.DepthMaterial( part.material ) or part.material
 			if state.material ~= material then
 				render.SetMaterial( material )
 				state.material = material
@@ -542,7 +662,7 @@ local function passGroups( mini, pvs )
 			if count > 0 then
 				local parts = group.meshes
 				if not parts or parts.hasOpaque then opaque[#opaque + 1] = group end
-				if parts and parts.hasTranslucent or not parts and group.entTranslucent ~= false then
+				if group.hasFade or parts and parts.hasTranslucent or not parts and group.entTranslucent ~= false then
 					translucent[#translucent + 1] = group
 				end
 			end
@@ -557,43 +677,20 @@ end
 -- Use the active render view: the player's actual eye may be outside the miniature.
 -- Unknown projection modes fail open, including off-center and orthographic cameras.
 local function viewFrustum( mini )
-	-- Water reflections/refractions draw the miniature under a nested cam.Start3D.
-	-- GetViewSetup still describes the main view, so its planes are unsafe here.
-	if PocketMap.Water and PocketMap.Water.pass then return nil end
-	if render.GetRenderTarget and render.GetRenderTarget() then return nil end
-	local view = render.GetViewSetup()
-	if not view or not view.origin or not view.angles or view.ortho or view.offcenter or view.subrect then return nil end
-	-- Third-person and alternate camera hooks can render a different viewpoint.
-	if EyePos():DistToSqr( view.origin ) > 1 then return nil end
-	local eyeAngles = EyeAngles()
-	if eyeAngles:Forward():Dot( view.angles:Forward() ) < 0.999
-		or eyeAngles:Up():Dot( view.angles:Up() ) < 0.999 then return nil end
-	local fov, width, height = view.fov, view.width, view.height
-	if not fov or fov <= 1 or fov * 0.5 + FRUSTUM_FOV_PAD >= 90
-		or not width or not height or width <= 0 or height <= 0 then return nil end
-
-	local aspect = width / height
-	-- Some Source views provide the horizontal FOV for a 4:3 reference viewport.
-	-- Widen for other aspect ratios so either FOV convention is safe.
-	local halfWidth = math.tan( math.rad( fov * 0.5 + FRUSTUM_FOV_PAD ) ) * math.max( 1, aspect / ( 4 / 3 ) )
-	if view.aspect and view.aspect > 0 then aspect = math.min( aspect, view.aspect ) end
-	local halfHeight = halfWidth / aspect
-	-- Transform the camera once into the block. Prop sphere centers already use block space.
-	local angles = mini.ent:WorldToLocalAngles( view.angles )
-	return {
-		origin = mini.ent:WorldToLocal( view.origin ),
-		angles = angles,
-		forward = angles:Forward(), right = angles:Right(), up = angles:Up(),
-		halfWidth = halfWidth, halfHeight = halfHeight,
-		widthRadius = math.sqrt( 1 + halfWidth * halfWidth ),
-		heightRadius = math.sqrt( 1 + halfHeight * halfHeight ),
-	}
+	local view = PocketMap.Visibility.View( mini, FRUSTUM_FOV_PAD )
+	if view then
+		view.boxClip = not PocketMap.Settings and cvWaterClipBounds:GetBool()
+			or PocketMap.Settings and PocketMap.Settings.Compat( mini, "water_clip_bounds", cvWaterClipBounds )
+	end
+	return view
 end
 
 -- An opaque and translucent pass can share their visible props only when the
 -- camera, PVS and block transform are unchanged. Nested/unknown views fail open.
-local function sameCullView( context, stamp, pvs, frustum )
-	if not context or not frustum or ( not cvPropFrustumCache:GetBool() and context.frame ~= FrameNumber() )
+local function sameCullView( context, stamp, pvs, frustum, mini )
+	local cache = cvPropFrustumCache:GetBool()
+	if PocketMap.Settings then cache = PocketMap.Settings.Compat( mini, "prop_frustum_cache", cvPropFrustumCache ) end
+	if not context or not frustum or ( not cache and context.frame ~= FrameNumber() )
 		or context.stamp ~= stamp or context.pvs ~= pvs then return false end
 	local old = context.frustum
 	local a, b = old.origin, frustum.origin
@@ -601,6 +698,9 @@ local function sameCullView( context, stamp, pvs, frustum )
 	return a.x == b.x and a.y == b.y and a.z == b.z
 		and oldAngles.p == newAngles.p and oldAngles.y == newAngles.y and oldAngles.r == newAngles.r
 		and old.halfWidth == frustum.halfWidth and old.halfHeight == frustum.halfHeight
+		and old.boxClip == frustum.boxClip
+		and ( not old.clip and not frustum.clip or old.clip and frustum.clip
+			and old.clip.normal == frustum.clip.normal and old.clip.distance == frustum.clip.distance )
 end
 
 local function visibleInFrustum( prop, frustum )
@@ -610,45 +710,43 @@ local function visibleInFrustum( prop, frustum )
 	local forward, right, up = frustum.forward, frustum.right, frustum.up
 	local depth = dx * forward.x + dy * forward.y + dz * forward.z
 	local radius = prop.sphereRadius
+	local clip = frustum.clip
+	if clip then
+		local extent, n = frustum.boxClip and prop.boxExtents, clip.normal
+		local support = extent and ( math.abs( n.x ) * extent.x + math.abs( n.y ) * extent.y + math.abs( n.z ) * extent.z ) or radius
+		if center:Dot( n ) + support < clip.distance then return false end
+	end
 	if depth + radius < 0 then return false end
 	if math.abs( dx * right.x + dy * right.y + dz * right.z ) > depth * frustum.halfWidth + radius * frustum.widthRadius then return false end
 	if math.abs( dx * up.x + dy * up.y + dz * up.z ) > depth * frustum.halfHeight + radius * frustum.heightRadius then return false end
 	return true
 end
 
--- BSP PVS can include rooms hidden by walls from this particular eye position.
--- Test the center and all eight padded corners of an enclosing sphere; any
--- unobstructed ray keeps the prop visible. Animated props have no fixed bounds.
+-- Only a single opaque convex face can prove this enclosing box is hidden.
 local function propBehindWorld( mini, prop, eye )
 	if not prop.lcenter or not prop.sphereRadius then return false end
 	local radius = prop.sphereRadius / mini.scale
 	if radius <= 0 or radius > OCCLUSION_MAX_RADIUS then return false end
 	local center = ( prop.lcenter - mini.boxCenter ) / mini.scale + mini.mapCenter
-	local bsp = mini.bsp
-	local function blocked( target )
-		local trace = bsp:SurfaceTraceLine( eye, target )
-		return trace and trace.Hit and not trace.HitSky and trace.Fraction < 0.96
-	end
-	if not blocked( center ) then return false end
-	local extent = radius + OCCLUSION_PAD
-	for x = -1, 1, 2 do for y = -1, 1, 2 do for z = -1, 1, 2 do
-		if not blocked( center + Vector( x * extent, y * extent, z * extent ) ) then return false end
-	end end end
-	return true
+	local extent = Vector( radius + OCCLUSION_PAD, radius + OCCLUSION_PAD, radius + OCCLUSION_PAD )
+	return PocketMap.Visibility.Occluded( mini.bsp, eye, center, PocketMap.Visibility.BoxCorners( center - extent, center + extent ) )
 end
 
 -- A moving eye invalidates its old occlusion results. The queue is populated
 -- by props actually encountered in the frustum, and one is traced per frame.
 -- Unknown views and BSPs without visibility information draw every prop.
 local function propOcclusion( mini, pvs, frustum )
-	if not cvPropOcclusion:GetBool() or not pvs or not frustum or not mini.bsp.SurfaceTraceLine then return nil end
+	if PocketMap.Water and PocketMap.Water.pass then return nil end
+	local enabled = cvPropOcclusion:GetBool()
+	if PocketMap.Settings then enabled = PocketMap.Settings.Compat( mini, "prop_occlusion", cvPropOcclusion ) end
+	if not enabled or not pvs or not frustum or not mini.bsp.SurfaceTraceLine then return nil end
 	local eye = ( frustum.origin - mini.boxCenter ) / mini.scale + mini.mapCenter
 	local cache = mini.propOcclusion
 	if not cache or cache.groups ~= mini.propGroups or cache.bsp ~= mini.bsp then
 		cache = { groups = mini.propGroups, bsp = mini.bsp, generation = 0 }
 		mini.propOcclusion = cache
 	end
-	if not cache.eye or cache.pvs ~= pvs or cache.eye:DistToSqr( eye ) > OCCLUSION_RECHECK_DISTANCE ^ 2 then
+	if not cache.eye or cache.pvs ~= pvs or cache.eye ~= eye then
 		cache.eye, cache.pvs = eye, pvs
 		cache.generation = cache.generation + 1
 		cache.queue, cache.nextIndex, cache.count = {}, 1, 0
@@ -682,10 +780,22 @@ local function traceNextProp( mini, cache )
 	prop.occlusionCache, prop.occlusionGeneration = cache, cache.generation
 end
 
+-- Source uses squared distance from the render origin and switches a partly
+-- faded static prop to the translucent pass. Distances here stay in BSP units.
+local function fadeAlpha( prop, eye )
+	local fade = prop.fade
+	if not fade or not eye then return 1 end
+	local distance = prop.origin:DistToSqr( eye )
+	if distance >= fade.last then return 0 end
+	if fade.first < 0 or distance <= fade.first then return 1 end
+	return math.floor( 255 * ( fade.last - distance ) / ( fade.last - fade.first ) ) / 255
+end
+
 local function drawGroup( mini, group, translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse, occlusion, shadowFlags )
 	local parts = group.meshes
-	if parts and not hasHalf( parts, translucent ) then return 0 end
-	if not parts and translucent and group.entTranslucent == false then return 0 end
+	local inPass = not parts or hasHalf( parts, translucent )
+	if not inPass and not ( translucent and group.hasFade and state.fadeEye ) then return 0 end
+	if not parts and translucent and group.entTranslucent == false and not group.hasFade then return 0 end
 
 	local flags = DRAW_FLAGS
 	local prepared = parts ~= nil
@@ -710,43 +820,67 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 				visibleCount = visibleCount + 1
 				visible[visibleCount] = p
 			end
-			if not propKnownHidden( p, occlusion ) then
-			-- Skip expensive model and material setup when the entire group is culled.
-			if not prepared then
-				flags = prepareEntityGroup( entity, group, translucent )
-				if not flags then return 0 end
-				flags = shadowFlags or flags
-				state.scale, state.skin = nil, nil
-				prepared = true
-			end
-			if p.stamp ~= stamp then
-				p.wpos, p.wang = LocalToWorld( p.lpos, p.langles, entPos, entAng )
-				p.stamp = stamp
-			end
-
-			drawn = drawn + 1
-			if not shadowFlags then setModelLight( state, p.light, mini.propLightTransform ) end
-
-			if parts then
-				-- The block's transform is unchanged on most frames. Reuse each
-				-- baked prop's matrix until the block moves instead of assembling
-				-- it before every draw in both passes.
-				if p.matrixStamp ~= stamp then
-					local matrix = p.drawMatrix or Matrix()
-					matrix:Identity()
-					matrix:SetTranslation( p.wpos )
-					matrix:SetAngles( p.wang )
-					matrix:SetScale( Vector( p.lscale, p.lscale, p.lscale ) )
-					p.drawMatrix, p.matrixStamp = matrix, stamp
+			local alpha = fadeAlpha( p, state.fadeEye )
+			local fading = alpha < 1
+			if alpha > 0 and ( fading and translucent or not fading and inPass )
+				and not propKnownHidden( p, occlusion ) then
+				-- Skip expensive model and material setup when the entire group is culled.
+				if not prepared then
+					flags = prepareEntityGroup( entity, group, translucent and not group.hasFade )
+					if not flags then return 0 end
+					flags = shadowFlags or flags
+					state.scale, state.skin = nil, nil
+					prepared = true
+				end
+				if not state.source and p.stamp ~= stamp then
+					p.wpos, p.wang = LocalToWorld( p.lpos, p.langles, entPos, entAng )
+					p.stamp = stamp
 				end
 
-				cam.PushModelMatrix( p.drawMatrix )
-				drawParts( parts, translucent, state )
-				cam.PopModelMatrix()
-			else
-				drawEntityProp( entity, state, group, p.lscale, p.skin, p.wpos, p.wang, flags )
-				state.material = nil
-			end
+				drawn = drawn + 1
+				if not shadowFlags then setModelLight( state, p.light, state.lightTransform or mini.propLightTransform ) end
+				if fading then
+					render.SetBlend( alpha )
+					render.OverrideBlend( true, BLEND_SRC_ALPHA, BLEND_ONE_MINUS_SRC_ALPHA, BLENDFUNC_ADD )
+				end
+
+				if parts then
+					-- The block's transform is unchanged on most frames. Reuse each
+					-- baked prop's matrix until the block moves instead of assembling
+					-- it before every draw in both passes.
+					if state.source then
+						if not p.sourceMatrix then
+							local origin = p.origin or ( p.lpos - mini.boxCenter ) / mini.scale + mini.mapCenter
+							local scale = p.uscale or p.lscale / mini.scale
+							local matrix = Matrix()
+							matrix:SetTranslation( origin )
+							matrix:SetAngles( p.langles )
+							matrix:SetScale( Vector( scale, scale, scale ) )
+							p.sourceMatrix = matrix
+						end
+					elseif p.matrixStamp ~= stamp then
+						local matrix = p.drawMatrix or Matrix()
+						matrix:Identity()
+						matrix:SetTranslation( p.wpos )
+						matrix:SetAngles( p.wang )
+						matrix:SetScale( Vector( p.lscale, p.lscale, p.lscale ) )
+						p.drawMatrix, p.matrixStamp = matrix, stamp
+					end
+
+					cam.PushModelMatrix( state.source and p.sourceMatrix or p.drawMatrix )
+					drawParts( parts, translucent, state, fading )
+					cam.PopModelMatrix()
+				else
+					if not translucent or fading or group.entTranslucent then
+						local drawFlags = translucent and DRAW_FLAGS or flags
+						drawEntityProp( entity, state, group, p.lscale, p.skin, p.wpos, p.wang, drawFlags )
+					end
+					state.material = nil
+				end
+				if fading then
+					render.OverrideBlend( false )
+					render.SetBlend( 1 )
+				end
 			end
 		end
 	end
@@ -757,36 +891,15 @@ local function drawGroup( mini, group, translucent, entity, state, stamp, entPos
 	return drawn
 end
 
-local function drawPass( mini, translucent )
+local sourceLightMatrix = Matrix()
+
+local function drawPass( mini, translucent, beginSource )
+	if translucent and PocketMap.Settings and not PocketMap.Settings.Enabled( mini, "translucent_props" ) then return end
 	if #mini.propGroups == 0 then return end
 
 	local walk = PocketMap.Walk and PocketMap.Walk.session
-	local pvs
 	local frustum = viewFrustum( mini )
-	if frustum and walk and walk.mini == mini and mini.bsp and mini.scale and mini.scale > 0 and mini:EyeInside() then
-		local height = not walk.noclip and bit.band( walk.move.buttons, IN_DUCK ) ~= 0 and 28 or 64
-		local origin = walk.move.origin + Vector( 0, 0, height )
-		local camera = ( origin - mini.mapCenter ) * mini.scale + mini.boxCenter
-		local tolerance = mini.scale * 4
-		-- The walker's PVS only represents their own viewpoint. Other cameras
-		-- (third person, mirrors, nested views) must draw all uncertain props.
-		if frustum.origin:DistToSqr( camera ) <= tolerance * tolerance then
-			pvs = PocketMap.PVSFreeze.Get( mini )
-			if not pvs then
-				local eye = ( frustum.origin - mini.boxCenter ) / mini.scale + mini.mapCenter
-				local bsp = mini.bsp
-				local cluster = bsp:ClusterFromPoint( eye )
-				local vis = cluster and cluster >= 0 and bsp:GetVisibility()
-				if vis and vis.VisData and vis.VisData[cluster] and not bsp:IsVisibilityCorrupted() then
-					if mini.propPVSCluster ~= cluster or mini.propPVSBSP ~= bsp then
-						mini.propPVSCluster, mini.propPVSBSP = cluster, bsp
-						mini.propPVS = bsp:PVSForOrigin( eye )
-					end
-					pvs = mini.propPVS
-				end
-			end
-		end
-	end
+	local pvs = walk and walk.mini == mini and PocketMap.Visibility.PVS( mini, frustum, true ) or nil
 	local groups = passGroups( mini, pvs )
 	local occlusion = propOcclusion( mini, pvs, frustum )
 	local selected = translucent and groups.translucent or groups.opaque
@@ -798,10 +911,14 @@ local function drawPass( mini, translucent )
 	local entity = propEntity( mini )
 	local stamp, entPos, entAng = updateStamp( mini )
 	mini.propLightTransform = PocketMap.PropLight.Transform( mini.matrix, mini.propLightTransform )
-	local state = {}
+	local fadeEye = frustum and frustum.mapOrigin
+	if not fadeEye and not render.GetRenderTarget() then
+		fadeEye = ( mini.ent:WorldToLocal( EyePos() ) - mini.boxCenter ) / mini.scale + mini.mapCenter
+	end
+	local state = { fadeEye = fadeEye }
 	local drawn = 0
 	local context
-	local reuse = sameCullView( mini.propCullContext, stamp, pvs, frustum )
+	local reuse = sameCullView( mini.propCullContext, stamp, pvs, frustum, mini )
 	if reuse then
 		context = mini.propCullContext
 		context.frame = FrameNumber()
@@ -813,23 +930,44 @@ local function drawPass( mini, translucent )
 	render.SuppressEngineLighting( true )
 	if translucent then render.OverrideDepthEnable( true, false ) end
 
-	for i = 1, #selected do
-		drawn = drawn + drawGroup( mini, selected[i], translucent, entity, state, stamp, entPos, entAng, pvs, frustum, context, reuse, occlusion )
+	-- Submit rigid meshes in the same source projection as the world. The
+	-- scaled entity path remains available for posed models and other cameras.
+	local source, fogScale
+	if beginSource then source, fogScale = beginSource( mini ) end
+	local function drawSelected( drawState, baked )
+		for _, group in ipairs( selected ) do
+			if baked == nil or ( group.meshes ~= nil ) == baked then
+				drawn = drawn + drawGroup( mini, group, translucent, entity, drawState, stamp, entPos, entAng,
+					pvs, frustum, context, reuse, occlusion )
+			end
+		end
+	end
+	local ok, err
+	if source then
+		mini.sourcePropLight = PocketMap.PropLight.Transform( sourceLightMatrix, mini.sourcePropLight )
+		ok, err = pcall( drawSelected, { source = true, lightTransform = mini.sourcePropLight, fadeEye = fadeEye }, true )
+		cam.End3D()
+		if fogScale then PocketMap.Fog.SetScale( fogScale ) end
+		if ok then ok, err = pcall( drawSelected, state, false ) end
+	else
+		ok, err = pcall( drawSelected, state )
 	end
 
 	if translucent then render.OverrideDepthEnable( true, true ) end
+	if not ok then render.OverrideBlend( false ) render.SetBlend( 1 ) end
 	render.SetLocalModelLights()
 	render.SetColorModulation( 1, 1, 1 )
 	render.SuppressEngineLighting( false )
+	if not ok then error( err, 0 ) end
 	traceNextProp( mini, occlusion )
 
 	if not translucent then mini.propsDrawn = drawn end
 end
 
 ---@param pass "opaque"|"translucent"|nil # nil draws both halves
-function Props.Draw( mini, pass )
-	if pass ~= "translucent" then drawPass( mini, false ) end
-	if pass ~= "opaque" then drawPass( mini, true ) end
+function Props.Draw( mini, pass, beginSource )
+	if pass ~= "translucent" then drawPass( mini, false, beginSource ) end
+	if pass ~= "opaque" then drawPass( mini, true, beginSource ) end
 end
 
 -- Use every opaque caster, independently of the viewer's visibility caches.
@@ -912,6 +1050,8 @@ local function drawSkyGroup( mini, group, translucent, skyMatrix, state )
 end
 
 local function drawSkyPass( mini, skyMatrix, translucent )
+	if PocketMap.Settings and ( not PocketMap.Settings.Enabled( mini, "sky_props" )
+		or translucent and not PocketMap.Settings.Enabled( mini, "translucent_props" ) ) then return end
 	local groups = skyPassGroups( mini )
 	local selected = translucent and groups.translucent or groups.opaque
 	if #selected == 0 then return end

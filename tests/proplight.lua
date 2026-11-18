@@ -99,7 +99,10 @@ local m=Matrix()m.angles=Angle(0,90)m.scale=.01
 local transform=P.Transform(m)
 local first=P.ForRender(lit,transform)
 for _,l in ipairs(first.direct)do
-	if l.type==2 then close(l.dir.y,-1/math.sqrt(2))close(l.dir.z,1/math.sqrt(2)) end
+	if l.type==2 then
+		close(l.dir.y,1/math.sqrt(2))close(l.dir.z,-1/math.sqrt(2))
+		assert(-l.dir:Dot(Vector(0,0,1))>0,'sun points away from upward-facing surfaces in the model shader')
+	end
 	if l.type==3 then close(l.innerAngle,20)close(l.outerAngle,40)close(l.angularFalloff,2)end
 end
 tick=1
@@ -108,8 +111,98 @@ assert(first~=second and first.cube==second.cube,'style animation rebuilt static
 local changed=false
 for i,l in ipairs(first.direct)do if second.direct[i].color.x~=l.color.x then changed=true end end
 assert(changed,'animated direct light did not animate')
+local beforeReload=P.ForRender(lit,transform)
+dofile('lua/pocketmap/cl_proplight.lua')
+local afterReload=PocketMap.PropLight.ForRender(lit,transform)
+assert(afterReload~=beforeReload and afterReload.system==PocketMap.PropLight,
+	'hot reload retained stale light directions in an existing miniature')
 bsp.SurfaceTraceLine=function()return {Hit=true,HitSky=false}end
 assert(#sampler:Of({Origin=Vector()}).direct==0,'roof or walls failed to block light')
 bsp.SurfaceTraceLine=function()return {Hit=true,HitSky=true}end
 assert(#sampler:Of({Origin=Vector()}).direct==1,'sky trace did not admit only skylight')
-print('Prop lighting: ambient, visibility, origins, scaled irradiance, rotation, sun, spots and animation passed')
+local Current=PocketMap.PropLight
+local empty={mini=mini,direct={}}
+local other={mini=mini,direct={}}
+for side=1,6 do empty[side]={.2,.4,.6};other[side]={.2,.4,.6}end
+local a=Current.ForRender(empty,transform)
+tick=tick+1
+local b=Current.ForRender(empty,transform)
+assert(a==b,'empty direct lighting must not invalidate at the lightstyle clock')
+assert(Current.ForRender(other,transform).direct==a.direct,'empty native light state must be shared between props')
+local directional=false
+PocketMap.Settings={Enabled=function(_,key)return key~='directional_prop_ambient' or directional end}
+local flat=Current.ForRender(empty,transform)
+assert(flat.uniform and flat.cube[1]==flat.cube[6],'averaged ambient must use one local color')
+close(flat.uniform[1],.2)close(flat.uniform[2],.4)close(flat.uniform[3],.6)
+local f=assert(io.open('lua/pocketmap/cl_props.lua','r'));local src=f:read('*a');f:close()
+local first=assert(src:find('local function setModelLight(',1,true))
+local last=assert(src:find('local function drawParts(',first,true))
+local chunk=assert(loadstring(src:sub(first,last-1)..' return setModelLight'))
+local clears,resets,sides=0,0,0
+local env=setmetatable({PocketMap=PocketMap,SIDES=6,Props={},render={
+	SetLocalModelLights=function()clears=clears+1 end,
+	ResetModelLighting=function()resets=resets+1 end,
+	SetModelLighting=function()sides=sides+1 end}},{__index=_G})
+setfenv(chunk,env)local bind=chunk()
+local state={}
+bind(state,empty,transform)bind(state,other,transform)
+assert(clears==1 and resets==1 and sides==0,'identical flat-lit props must share one light clear and one ambient update')
+directional=true
+bind(state,empty,transform)
+assert(not state.uniform,'switching back to directional ambient must restore per-side lighting state')
+local blockedCalls,fullCalls=0,0
+bsp.SurfaceTraceBlocked=function() blockedCalls=blockedCalls+1 return true end
+bsp.SurfaceTraceLine=function() fullCalls=fullCalls+1 return {Hit=true,HitSky=true} end
+local direct=sampler:DirectLights(Vector())
+assert(#direct==1 and direct[1]==sun,'fast occlusion admitted blocked lights or lost sunlight')
+assert(blockedCalls==2 and fullCalls==1,'non-sun lights must use boolean occlusion; sunlight must use the sky-aware trace')
+bsp.SurfaceTraceBlocked=function() return false end
+bsp.SurfaceTraceLine=function() return {Hit=true,HitSky=false} end
+assert(#sampler:DirectLights(Vector())==2,'unblocked point/spot lights were dropped or roof admitted sunlight')
+bsp.SurfaceTraceBlocked=nil
+assert(#sampler:DirectLights(Vector())==0,'older NikNaks fallback did not retain full-trace occlusion')
+
+-- A stored ZIP containing one VHV from each lighting variant. LOD 1 is
+-- saturated green, so an accidental cross-LOD average is visible here.
+local function le(n,count)
+	local bytes={}
+	for i=1,count or 4 do bytes[i]=string.char(n%256) n=math.floor(n/256) end
+	return table.concat(bytes)
+end
+local function vhv(r,b)
+	local function group(lod,offset)
+		return le(lod)..le(1)..le(offset)..string.rep("\0",16)
+	end
+	return le(2)..le(123)..le(4)..le(4)..le(2)..le(2)..string.rep("\0",16)
+		..group(1,96)..group(0,100)..string.char(0,255,0,255,b,0,r,255)
+end
+local function zip(entries)
+	local locals,central={},{}
+	local offset,size=0,0
+	for _,entry in ipairs(entries) do
+		local name,data=entry[1],entry[2]
+		local sizes=le(7)..le(#data)..le(#data)..le(#name,2)
+		local localRecord="PK\3\4"..le(20,2)..string.rep("\0",8)..sizes..le(0,2)..name..data
+		local directory="PK\1\2"..le(20,2)..le(20,2)..string.rep("\0",8)..sizes..string.rep("\0",12)..le(offset)..name
+		locals[#locals+1],central[#central+1]=localRecord,directory
+		offset,size=offset+#localRecord,size+#directory
+	end
+	return table.concat(locals)..table.concat(central).."PK\5\6"..le(0)..le(#entries,2)..le(#entries,2)..le(size)..le(offset)..le(0,2)
+end
+util.CRC=function()return "7" end
+local archive=zip({{"sp_0.vhv",vhv(96,0)},{"sp_hdr_0.vhv",vhv(0,50)}})
+bsp.GetLumpString=function(_,lump)assert(lump==40)return archive end
+dofile("lua/pocketmap/cl_pak.lua")
+local vertexLights=PocketMap.Pak.StaticPropLights(bsp,false,{[0]={}})
+local hdrLights=PocketMap.Pak.StaticPropLights(bsp,true,{[0]={}})
+close(vertexLights[0].color[1],(192/255)^2.2,"baked sRGB brightness or strip-group LOD")
+close(vertexLights[0].color[2],0)
+close(hdrLights[0].color[3],(100/255)^2.2,"HDR must use its own packed static-prop lighting")
+file={Open=function(path)return {Seek=function(_,offset)assert(offset==8)end,
+	ReadULong=function()return path=="model" and 123 or 456 end,Close=function()end}end}
+local static=Current.New(mini,bsp,true,vertexLights)
+local authored=Current.ForRender(static:Of({Origin=Vector(),StaticIndex=0},"model"),transform)
+assert(authored.uniform==vertexLights[0].color and #authored.direct==0,"baked lighting must replace the approximate direct lights")
+assert(not static:Of({Origin=Vector(),StaticIndex=1},"model").baked,"unbaked props must retain sampled lighting")
+assert(not static:Of({Origin=Vector(),StaticIndex=0},"different-model").baked,"mismatched model accepted another prop's lighting")
+print('Prop lighting: native lights, animation, shared render states and packed static-prop lighting passed')

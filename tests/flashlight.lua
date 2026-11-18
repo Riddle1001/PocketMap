@@ -98,4 +98,108 @@ local removed=0
 F.projector={Remove=function(self)self.removed=true removed=removed+1 end}
 F.Stop() F.Stop()
 assert(removed==1 and not F.projector and not F.mini, "projector leaked after exit")
+
+local opaqueA, opaqueB = {}, {}
+for _, m in ipairs({opaqueA, opaqueB}) do
+	function m:GetName() return self == opaqueA and "opaque/a" or "opaque/b" end
+	function m:GetInt() return 0 end
+	function m:GetTexture() return nil end
+end
+assert(F.DepthMaterial(opaqueA) == F.DepthMaterial(opaqueB), "opaque surfaces did not share a depth material")
+assert(F.DepthMaterial(opaqueA) ~= depth, "cutout lost its separate mask")
+
+local uploaded, destroyed, inputVertices = 0, 0, 0
+local function builder()
+	local groups = {}
+	return {
+		AddFace = function(_, face, options)
+			inputVertices = inputVertices + #face:GenerateVertexTriangleData()
+			groups[options.material] = true
+		end,
+		Build = function()
+			uploaded = uploaded + 1
+			local parts = {}
+			for material in pairs(groups) do parts[#parts+1] = {material=material} end
+			return {GetMeshes=function()return parts end,Destroy=function()destroyed=destroyed+1 end}
+		end,
+	}
+end
+NikNaks = {MeshBuilder=setmetatable({BlendsWithBackground=function(m)return m.translucent end},{__call=builder})}
+local vertices = {}
+for i=1,6 do vertices[i]={} end
+local face = {GenerateVertexTriangleData=function()return vertices end}
+local mini = {}
+local co = coroutine.create(function()
+	for i=1,2100 do F.AddWorldShadowFace(mini,face,i%2==0 and opaqueA or opaqueB) end
+	F.AddWorldShadowFace(mini,face,material)
+	F.AddWorldShadowFace(mini,face,{translucent=true})
+	F.FlushWorldShadows(mini)
+end)
+repeat local ok,err=coroutine.resume(co) assert(ok,err) until coroutine.status(co)=="dead"
+assert(inputVertices==2101*6, "batch dropped opaque/cutout triangles or added translucent casters")
+assert(uploaded==2 and #mini.worldShadowMeshes==3, "depth batches retained the color material splits")
+F.FreeWorldShadows(mini) F.FreeWorldShadows(mini)
+assert(destroyed==2 and not mini.worldShadowMeshes and not mini.worldShadowBuilder, "shadow geometry leaked on removal")
+
+local matrices, meshDraws, bindings, dynamicDraws = 0, 0, 0, 0
+cam = {PushModelMatrix=function()matrices=matrices+1 end,PopModelMatrix=function()matrices=matrices-1 end}
+render = {SetMaterial=function()bindings=bindings+1 end}
+PocketMap.MapIO = {DrawDepth=function()dynamicDraws=dynamicDraws+1 end}
+PocketMap.Props = {DrawDepth=function()dynamicDraws=dynamicDraws+1 end}
+local shadowPart={material=F.DepthMaterial(opaqueA),mesh={Draw=function()meshDraws=meshDraws+1 end}}
+mini={state="ready",scaleVec={},matrix={},UpdateMatrix=function()end,
+	objects={opaqueMeshes={{material=opaqueA,mesh=shadowPart.mesh}}},worldShadowMeshes={shadowPart,shadowPart}}
+F.DrawDepth(mini, 123)
+assert(meshDraws==2 and bindings==1 and dynamicDraws==2 and matrices==0, "batched depth skipped casters or dynamic geometry")
+mini.worldShadowMeshes=nil
+F.DrawDepth(mini,123)
+assert(meshDraws==3 and dynamicDraws==4 and matrices==0, "legacy miniature depth fallback broke")
+mini.worldShadowMeshes={{material=shadowPart.material,mesh={Draw=function()error("shadow draw fixture")end}}}
+assert(not pcall(F.DrawDepth,mini,123) and matrices==0, "failed shadow draw leaked its matrix")
+
+-- Exercise the real loader slice as well as the batching API: shadow vertices
+-- must be consumed before the face cache is cleared, and sky slices stay out.
+PocketMap.Mini = {}
+PocketMap.Water = {}
+function CreateClientConVar()return {} end
+dofile("lua/pocketmap/cl_loader.lua")
+local function upvalue(fn, name)
+	for i=1,100 do local k,v=debug.getupvalue(fn,i) if k==name then return v end end
+	error("Missing loader stage: "..name)
+end
+local buildSlice=upvalue(upvalue(upvalue(PocketMap.Loader.Run,"buildWorldMeshes"),"buildMaterialGroups"),"buildSlice")
+for _,v in ipairs(vertices) do v.pos={x=1,y=2,z=3} end
+local cleared=0
+face.ClearMeshData=function()cleared=cleared+1 end
+local faces={}
+for i=1,20 do faces[i]=face end
+local shadowMini={}
+co=coroutine.create(function()
+	buildSlice(faces,1,#faces,{material=opaqueA},shadowMini)
+	assert(shadowMini.worldShadowVertices==120, "loader omitted static shadow faces")
+	F.FlushWorldShadows(shadowMini)
+	buildSlice(faces,1,#faces,{material=opaqueA})
+end)
+repeat local ok,err=coroutine.resume(co) assert(ok,err) until coroutine.status(co)=="dead"
+assert(cleared==40 and #shadowMini.worldShadowMeshes==1 and not shadowMini.worldShadowBuilder, "loader slice/face-cache lifecycle broke")
+F.FreeWorldShadows(shadowMini)
+
+local poseTrace=upvalue(F.Pose,"poseTrace")
+local traceCalls=0
+local traceSession={command=1,io={world={}},TraceHull=function()
+	traceCalls=traceCalls+1 return {Hit=false,Fraction=1}
+end}
+local start,finish=Vector(),Vector(10,20,30)
+local result=poseTrace(traceSession,1,start,finish,123)
+assert(poseTrace(traceSession,1,start,finish,123)==result and traceCalls==1,"identical pose probe was repeated")
+poseTrace(traceSession,2,start,finish,123)
+assert(traceCalls==2,"independent probes shared a cache slot")
+traceSession.command=2 poseTrace(traceSession,1,start,finish,123)
+traceSession.io.drawRevision=1 poseTrace(traceSession,1,start,finish,123)
+traceSession.io.world={} poseTrace(traceSession,1,start,finish,123)
+traceSession.physics={} poseTrace(traceSession,1,start,finish,123)
+poseTrace(traceSession,1,start,finish,124)
+assert(traceCalls==7,"movement, I/O, collision or mask change reused a stale probe")
+F.Stop()
+assert(not F.poseTraces,"pose trace cache survived flashlight cleanup")
 print("PASS flashlight: native handoff, F toggle, permissions, death, distance-invariant beam, cutout shadows, cached materials, cleanup")

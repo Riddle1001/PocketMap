@@ -14,6 +14,30 @@ local cvWorldFrustumCache = CreateClientConVar( "pocketmap_world_frustum_cache",
 	"Reuse visible world meshes while the rendered view and miniature are unchanged" )
 local cvWaterSceneCull = CreateClientConVar( "pocketmap_water_scene_cull", "1", true, false,
 	"Cull world meshes outside the water reflection and refraction cameras" )
+local cvWorldDepthMaterial = CreateClientConVar( "pocketmap_world_depth_material", "0", true, false,
+	"Use a simpler opaque shader in the miniature world depth-only pass" )
+local cvWaterClipBounds = CreateClientConVar( "pocketmap_water_clip_bounds", "1", true, false,
+	"Cache conservative world candidates on each side of a water plane" )
+local worldDepthMaterial = CreateMaterial( "PocketMap_WorldDepthOpaque_v1", "UnlitGeneric", {
+	["$basetexture"] = "models/debug/debugwhite",
+	["$model"] = "0",
+} )
+local worldDepthSafe = setmetatable( {}, { __mode = "k" } )
+
+-- A colorless depth pass still needs the original shader for alpha clipping,
+-- two-sided surfaces and shaders that might change vertex positions.
+local function depthMaterialFor( material )
+	local safe = worldDepthSafe[material]
+	if safe == nil then
+		local shader = material:GetShader()
+		safe = ( shader == "LightmappedGeneric" or shader == "WorldVertexTransition_DX9"
+			or shader == "WorldVertexTransition" )
+			and bit.band( material:GetInt( "$flags" ) or 0, 0x3200 ) == 0
+			and ( material:GetInt( "$alphatest" ) or 0 ) == 0
+		worldDepthSafe[material] = safe
+	end
+	return safe and worldDepthMaterial or nil
+end
 
 ---Mark the miniature's pixels for its sky and backdrop passes.
 local function beginStencil()
@@ -29,11 +53,15 @@ local function beginStencil()
 end
 
 ---Without an atlas the map is drawn fullbright.
+local previewOptions = { light = false, fullbright = true, preview = true }
 local function drawOptions( mini )
+	if PocketMap.Settings and PocketMap.Settings.MinimalPreview( mini ) then return previewOptions end
 	local options = mini.drawOptions
-	if options and options.lightmap == mini.lightmapTexture then return options end
+	local fullbright = mini.lightmapTexture == nil
+	if PocketMap.Settings and not PocketMap.Settings.Enabled( mini, "lightmaps" ) then fullbright = true end
+	if options and options.lightmap == mini.lightmapTexture and options.fullbright == fullbright then return options end
 
-	options = { light = false, lightmap = mini.lightmapTexture, fullbright = mini.lightmapTexture == nil }
+	options = { light = false, lightmap = mini.lightmapTexture, fullbright = fullbright }
 	mini.drawOptions = options
 	return options
 end
@@ -41,62 +69,30 @@ end
 -- The water pass supplies its own camera. Other render targets use the
 -- primary-view checks before enabling world frustum culling.
 local function worldView( mini )
-	if not mini.scale or mini.scale <= 0 then return nil end
-	local waterView = Water.pass and cvWaterSceneCull:GetBool() and Water.sceneView
-	if Water.pass and not waterView then return nil end
-	if not Water.pass and render.GetRenderTarget and render.GetRenderTarget() then return nil end
-	local view = waterView or render.GetViewSetup()
-	if not view or not view.origin or not view.angles or view.ortho or view.offcenter or view.subrect then return nil end
-	if not waterView then
-		if EyePos():DistToSqr( view.origin ) > 1 then return nil end
-		local angles = EyeAngles()
-		if angles:Forward():Dot( view.angles:Forward() ) < 0.999
-			or angles:Up():Dot( view.angles:Up() ) < 0.999 then return nil end
+	local waterCull, clipBounds = cvWaterSceneCull:GetBool(), cvWaterClipBounds:GetBool()
+	if PocketMap.Settings then
+		waterCull = PocketMap.Settings.Compat( mini, "water_scene_cull", cvWaterSceneCull )
+		clipBounds = PocketMap.Settings.Compat( mini, "water_clip_bounds", cvWaterClipBounds )
 	end
-
-	local fov, width, height = view.fov, view.width, view.height
-	if not fov or fov <= 1 or fov * 0.5 + WORLD_FRUSTUM_FOV_PAD >= 90
-		or not width or not height or width <= 0 or height <= 0 then return nil end
-	local aspect = width / height
-	if view.aspect and view.aspect > 0 then aspect = math.min( aspect, view.aspect ) end
-	local tangent = math.tan( math.rad( fov * 0.5 + WORLD_FRUSTUM_FOV_PAD ) )
-	-- Source projections sometimes use a 4:3 reference horizontal FOV. The
-	-- extra width and height conservatively cover both FOV conventions.
-	local halfWidth = tangent * math.max( 1, ( width / height ) / ( 4 / 3 ) )
-	local halfHeight = math.max( tangent, halfWidth / aspect )
-	local localAngles = mini.ent:WorldToLocalAngles( view.angles )
-	return {
-		origin = mini.ent:WorldToLocal( view.origin ),
-		forward = localAngles:Forward(), right = localAngles:Right(), up = localAngles:Up(),
-		halfWidth = halfWidth, halfHeight = halfHeight,
-		widthRadius = math.sqrt( 1 + halfWidth * halfWidth ),
-		heightRadius = math.sqrt( 1 + halfHeight * halfHeight ),
-	}
+	local view = PocketMap.Visibility.View( mini, WORLD_FRUSTUM_FOV_PAD, waterCull )
+	if view then view.boxClip = clipBounds end
+	return view
 end
 
--- BSP clusters only represent visibility for an eye inside the miniature's
--- source map. Invalid VIS, sky views, or unknown cameras fail open.
 local function worldPVS( mini, view )
-	if Water.pass or not view or not mini.bsp or not mini:EyeInside() then return nil end
-	local frozen = PocketMap.PVSFreeze.Get( mini )
-	if frozen then return frozen end
-	local bsp = mini.bsp
-	local eye = ( view.origin - mini.boxCenter ) / mini.scale + mini.mapCenter
-	local cluster = bsp:ClusterFromPoint( eye )
-	if not cluster or cluster < 0 then return nil end
-	local vis = bsp:GetVisibility()
-	if not vis or not vis.VisData or not vis.VisData[cluster] or bsp:IsVisibilityCorrupted() then return nil end
-	if mini.worldPVSBSP ~= bsp or mini.worldPVSCluster ~= cluster then
-		mini.worldPVSBSP, mini.worldPVSCluster = bsp, cluster
-		mini.worldPVS = bsp:PVSForOrigin( eye )
-	end
-	return mini.worldPVS
+	return PocketMap.Visibility.PVS( mini, view, true )
 end
 
 local function worldPartVisible( part, view )
 	if not view then return true end
 	local center, radius = part.blockCenter, part.blockRadius
 	if center and radius then
+		local clip = view.clip
+		if clip then
+			local extent, n = view.boxClip and part.blockExtents, clip.normal
+			local support = extent and ( math.abs( n.x ) * extent.x + math.abs( n.y ) * extent.y + math.abs( n.z ) * extent.z ) or radius
+			if center:Dot( n ) + support < clip.distance then return false end
+		end
 		local dx, dy, dz = center.x - view.origin.x, center.y - view.origin.y, center.z - view.origin.z
 		local forward, right, up = view.forward, view.right, view.up
 		local depth = dx * forward.x + dy * forward.y + dz * forward.z
@@ -110,39 +106,73 @@ end
 -- The BSP PVS only changes when the eye enters another visibility cluster.
 -- Filter the material-ordered draw list once per PVS; the camera frustum is
 -- still tested every draw, so turning or moving within a cluster stays exact.
-local function worldPVSCandidates( mini, meshes, pvs, translucent )
-	if not pvs then return meshes end
-	local cache = mini.worldPVSCandidates
+local function worldPVSCandidates( mini, meshes, pvs, translucent, view )
+	local clip = view and view.boxClip and view.clip
+	if not pvs and not clip then return meshes end
+	local cache = mini.worldPVSCandidates or {}
 	local key = translucent and "translucent" or "opaque"
-	local entry = cache and cache[key]
-	if entry and entry.source == meshes and entry.pvs == pvs then return entry.parts end
-
-	local parts = {}
-	for i = 1, #meshes do
-		local part = meshes[i]
-		local clusters = part.worldClusters
-		local visible = not clusters
-		if clusters then
-			for j = 1, #clusters do
-				if pvs[clusters[j]] then visible = true break end
+	if Water.pass then key = Water.pass .. "_" .. key end
+	local entry = cache[key]
+	if not entry or entry.source ~= meshes or entry.pvs ~= pvs then
+		local parts = meshes
+		if pvs then
+			parts = {}
+			for i = 1, #meshes do
+				local part = meshes[i]
+				local clusters = part.worldClusters
+				local visible = not clusters
+				if clusters then
+					for j = 1, #clusters do
+						if pvs[clusters[j]] then visible = true break end
+					end
+				end
+				if visible then parts[#parts + 1] = part end
 			end
+		end
+		entry = { source = meshes, pvs = pvs, parts = parts, clips = {} }
+		cache[key], mini.worldPVSCandidates = entry, cache
+	end
+	if not clip then return entry.parts end
+
+	-- The geometry and water plane are static while the camera moves. Filter
+	-- once per plane/PVS, then frustum-test only meshes on the retained side.
+	entry.clips = entry.clips or {}
+	local n, distance = clip.normal, clip.distance
+	local nx, ny, nz = n.x, n.y, n.z
+	for i = 1, #entry.clips do
+		local c = entry.clips[i]
+		if c.x == nx and c.y == ny and c.z == nz and c.distance == distance then return c.parts end
+	end
+	local ax, ay, az = math.abs( nx ), math.abs( ny ), math.abs( nz )
+	local parts = {}
+	for i = 1, #entry.parts do
+		local part = entry.parts[i]
+		local center, radius, extent = part.blockCenter, part.blockRadius, part.blockExtents
+		local visible = true
+		if center and radius then
+			local support = extent and ( ax * extent.x + ay * extent.y + az * extent.z ) or radius
+			visible = not ( center.x * nx + center.y * ny + center.z * nz + support < distance )
 		end
 		if visible then parts[#parts + 1] = part end
 	end
-	cache = cache or {}
-	cache[key] = { source = meshes, pvs = pvs, parts = parts }
-	mini.worldPVSCandidates = cache
+	-- Bound storage even when an externally animated miniature creates many
+	-- distinct local clip planes. Eviction changes cost, never visibility.
+	if #entry.clips >= 16 then table.remove( entry.clips, 1 ) end
+	entry.clips[#entry.clips + 1] = { x = nx, y = ny, z = nz, distance = distance, parts = parts }
 	return parts
 end
 
 -- The world meshes and their bounds are immutable after loading. Within the
 -- same render view and PVS, avoid retesting hundreds of bounds every frame.
-local function worldFrustumParts( mini, meshes, pvs, translucent, view )
-	if not view or not cvWorldFrustumCache:GetBool() then return nil end
+local function worldFrustumParts( mini, meshes, pvs, translucent, view, worldEntry )
+	local cacheEnabled = cvWorldFrustumCache:GetBool()
+	if PocketMap.Settings then cacheEnabled = PocketMap.Settings.Compat( mini, "world_frustum_cache", cvWorldFrustumCache ) end
+	if not view or not cacheEnabled then return nil end
+	local shadows = worldEntry and PocketMap.WorldCache.Occluders( mini, worldEntry, view )
 	local key = translucent and "translucent" or "opaque"
 	if Water.pass then key = Water.pass .. "_" .. key end
 	local cache = mini.worldFrustumParts and mini.worldFrustumParts[key]
-	if cache and cache.source == meshes and cache.pvs == pvs then
+	if cache and cache.source == meshes and cache.pvs == pvs and cache.shadows == shadows then
 		local old = cache.view
 		local a, b = old.origin, view.origin
 		local f, g = old.forward, view.forward
@@ -152,23 +182,26 @@ local function worldFrustumParts( mini, meshes, pvs, translucent, view )
 			and f.x == g.x and f.y == g.y and f.z == g.z
 			and r.x == s.x and r.y == s.y and r.z == s.z
 			and u.x == v.x and u.y == v.y and u.z == v.z
-			and old.halfWidth == view.halfWidth and old.halfHeight == view.halfHeight then
+			and old.halfWidth == view.halfWidth and old.halfHeight == view.halfHeight
+			and old.boxClip == view.boxClip
+			and ( not old.clip and not view.clip or old.clip and view.clip
+				and old.clip.normal == view.clip.normal and old.clip.distance == view.clip.distance ) then
 			return cache.parts
 		end
 	end
-	local candidates = worldPVSCandidates( mini, meshes, pvs, translucent )
+	local candidates = worldPVSCandidates( mini, meshes, pvs, translucent, view )
 	local parts = cache and cache.parts or {}
 	local count = 0
 	for i = 1, #candidates do
 		local part = candidates[i]
-		if worldPartVisible( part, view ) then
+		if worldPartVisible( part, view ) and ( not shadows or not PocketMap.WorldCache.Occluded( part, shadows ) ) then
 			count = count + 1
 			parts[count] = part
 		end
 	end
 	for i = count + 1, #parts do parts[i] = nil end
 	mini.worldFrustumParts = mini.worldFrustumParts or {}
-	mini.worldFrustumParts[key] = { source = meshes, pvs = pvs, view = view, parts = parts }
+	mini.worldFrustumParts[key] = { source = meshes, pvs = pvs, view = view, parts = parts, shadows = shadows }
 	return parts
 end
 
@@ -177,53 +210,86 @@ end
 local sourceWorldMatrix = Matrix()
 
 -- World shaders sample cubemaps with source-map directions and expect unit
--- tangent frames. A scaled/rotated model matrix changes both. Rebase the camera
--- instead, preserving the parent projection's depth so the flashlight and props
--- can still be drawn in miniature space afterwards.
-local function beginSourceWorld( mini, options )
+-- tangent frames. Drawing in source units also preserves the separation of
+-- model triangles such as a logo and its backing. Scale both clip planes to
+-- keep depth comparable with any draw that still needs the parent camera.
+local function beginSourceView( mini )
+	if PocketMap.Settings and not PocketMap.Settings.Enabled( mini, "world_source_camera" ) then return false end
 	local walk = PocketMap.Walk and PocketMap.Walk.session
-	if not walk or walk.mini ~= mini or not options.lightmap or options.flashlight or Water.pass or render.GetRenderTarget() then return false end
-	local view = render.GetViewSetup()
+	if not walk or walk.mini ~= mini or Water.pass or render.GetRenderTarget() then return false end
+	local sceneView = PocketMap.Scene and PocketMap.Scene.View( mini )
+	local view = sceneView or render.GetViewSetup()
 	if not view or view.ortho or view.offcenter or view.subrect or not view.fov
 		or not view.znear or not view.zfar or not mini.scale or mini.scale <= 0 then return false end
-	local eye = ( mini.ent:WorldToLocal( EyePos() ) - mini.boxCenter ) / mini.scale + mini.mapCenter
-	local angles = mini.ent:WorldToLocalAngles( EyeAngles() )
+	local eye = ( mini.ent:WorldToLocal( sceneView and view.origin or EyePos() ) - mini.boxCenter ) / mini.scale + mini.mapCenter
+	local angles = mini.ent:WorldToLocalAngles( sceneView and view.angles or EyeAngles() )
 	cam.Start3D( eye, angles, view.fov, view.x, view.y, view.width, view.height,
 		view.znear / mini.scale, view.zfar / mini.scale )
-	return true
+	return true, PocketMap.Fog and PocketMap.Fog.SetScale( 1 )
 end
 
 local function drawWorld( mini, options, translucent, depthOnly )
+	if translucent and PocketMap.Settings and not PocketMap.Settings.Enabled( mini, "translucent_world" ) then return end
 	local objects = mini.objects
 	local meshes = translucent and objects.translucentMeshes or objects.opaqueMeshes
-	local batched = meshes and ( options.lightmap or options.flashlight ) and not options.lightOnly and not options.ignoreZ
+	local batched = meshes and ( options.preview or options.lightmap or options.flashlight ) and not options.lightOnly and not options.ignoreZ
 	if batched and #meshes == 0 then return end
 	if not batched and #objects == 0 then return end
 
 	-- Culling uses the parent camera, before entering source coordinates.
 	local view = batched and worldView( mini )
-	local pvs = batched and worldPVS( mini, view )
-	local sourceView = not translucent and not depthOnly and beginSourceWorld( mini, options )
+	local pvs = not options.preview and batched and worldPVS( mini, view )
+	local worldEntry
+	local cache = PocketMap.WorldCache
+	if batched and not translucent and not options.preview and not Water.pass and cache then
+		local compiled, entry = cache.Get( mini, pvs )
+		meshes = compiled or meshes
+		local flashlight = PocketMap.Flashlight
+		if cache.Occluders and not options.flashlight and not ( flashlight and flashlight.IsOn() ) then
+			worldEntry = entry
+		end
+	end
+	local sourceView, fogScale
+	if not translucent and not depthOnly and options.lightmap and not options.flashlight then
+		sourceView, fogScale = beginSourceView( mini )
+	end
+	local repairDepth = sourceView
+	if sourceView and PocketMap.Settings then
+		local flashlight = PocketMap.Flashlight
+		repairDepth = PocketMap.Settings.Enabled( mini, "world_depth_repair" )
+			or PocketMap.Settings.Enabled( mini, "flashlight" ) and flashlight and flashlight.IsOn()
+	end
 	local materialScale = sourceView and 1 or mini.scale
 	-- Leave room for the following miniature-space depth pass. Its projection
 	-- must exactly match the flashlight receiver pass, including float rounding.
-	if sourceView then render.DepthRange( 0.01, 1 ) end
+	if repairDepth then render.DepthRange( 0.01, 1 ) end
 	cam.PushModelMatrix( sourceView and sourceWorldMatrix or mini.matrix )
+	if options.fullbright then render.SetLightingMode( 1 ) end
 	local ok, err = pcall( function()
 	if batched then
 		-- One matrix and lightmap binding for all material slices of the static world.
 		-- The ordering of the meshes within each pass stays the same as MeshBuilder's.
-		local visible = worldFrustumParts( mini, meshes, pvs, translucent, view )
-		local candidates = visible or worldPVSCandidates( mini, meshes, pvs, translucent )
+		local visible = worldFrustumParts( mini, meshes, pvs, translucent, view, worldEntry )
+		local candidates = visible or worldPVSCandidates( mini, meshes, pvs, translucent, view )
 		if translucent then render.OverrideDepthEnable( true, false ) end
 		if options.lightmap then render.SetLightmapTexture( options.lightmap ) end
 		local lastMaterial
+		local lastBoundMaterial
+		local fastDepth = depthOnly and cvWorldDepthMaterial:GetBool()
+		if depthOnly and PocketMap.Settings then fastDepth = PocketMap.Settings.Compat( mini, "world_depth_material", cvWorldDepthMaterial ) end
 		local drawn = 0
 		for i = 1, #candidates do
 			local part = candidates[i]
 			if visible or worldPartVisible( part, view ) then
 				if part.material ~= lastMaterial then
-					render.SetMaterial( PocketMap.Materials.ForScale(part.material, materialScale) )
+					local boundMaterial = options.preview and PocketMap.Materials.ForPreview( part.material )
+						or fastDepth and depthMaterialFor( part.material )
+						or ( PocketMap.Materials.ForWorld and PocketMap.Materials.ForWorld( part.material, materialScale, mini )
+							or PocketMap.Materials.ForScale( part.material, materialScale ) )
+					if boundMaterial ~= lastBoundMaterial then
+						render.SetMaterial( boundMaterial )
+						lastBoundMaterial = boundMaterial
+					end
 					lastMaterial = part.material
 				end
 				part.mesh:Draw()
@@ -238,7 +304,7 @@ local function drawWorld( mini, options, translucent, depthOnly )
 		if translucent then render.OverrideDepthEnable( false ) end
 	else
 		-- Older loaded miniatures and maps without a lightmap use NikNaks' original drawing path.
-		local drawOptions = PocketMap.Materials.DrawOptions(options, materialScale)
+		local drawOptions = PocketMap.Materials.DrawOptions( options, materialScale )
 		for i = 1, #objects do
 			if translucent then objects[i]:DrawTranslucent( nil, drawOptions )
 			else objects[i]:DrawOpaque( nil, drawOptions ) end
@@ -246,10 +312,14 @@ local function drawWorld( mini, options, translucent, depthOnly )
 	end
 	end )
 	cam.PopModelMatrix()
-	if sourceView then cam.End3D() end
-	if sourceView then render.DepthRange( 0, 1 ) end
-	if not ok then error( err, 0 ) end
+	if options.fullbright then render.SetLightingMode( 0 ) end
 	if sourceView then
+		cam.End3D()
+		if fogScale then PocketMap.Fog.SetScale( fogScale ) end
+		render.DepthRange( 0, 1 )
+	end
+	if not ok then error( err, 0 ) end
+	if repairDepth then
 		render.OverrideColorWriteEnable( true, false )
 		render.OverrideAlphaWriteEnable( true, false )
 		local depthOK, depthError = pcall( drawWorld, mini, options, false, true )
@@ -257,93 +327,142 @@ local function drawWorld( mini, options, translucent, depthOnly )
 		render.OverrideAlphaWriteEnable( false )
 		if not depthOK then error( depthError, 0 ) end
 	end
+	return sourceView
 end
 
 local flashlightOptions = { light = false, fullbright = false, flashlight = true }
 local function drawFlashlights( mini )
+	if PocketMap.Settings and not PocketMap.Settings.Enabled( mini, "flashlight" ) then return end
 	if Water.pass then return end
-	render.RenderFlashlights(function()
+	render.RenderFlashlights( function()
 		drawWorld( mini, flashlightOptions, false )
-		PocketMap.MapIO.Draw(mini, PocketMap.Materials.DrawOptions(flashlightOptions, mini.scale), false)
+		PocketMap.MapIO.Draw( mini, PocketMap.Materials.DrawOptions( flashlightOptions, mini.scale ), false )
 		Props.Draw( mini, "opaque" )
-	end)
+	end )
 end
 
 ---@param pass "opaque"|"translucent"|nil # nil draws both halves
 local function drawContents( mini, options, pass )
+	if options.preview then
+		if pass ~= "translucent" then drawWorld( mini, options, false ) end
+		mini.propsDrawn = 0
+		return
+	end
 	local lite = Water.pass ~= nil
 	local doOpaque, doTranslucent = pass ~= "translucent", pass ~= "opaque" and not lite
 
 	if doOpaque then
-		drawWorld( mini, options, false )
-		PocketMap.MapIO.Draw(mini, PocketMap.Materials.DrawOptions(options, mini.scale), false)
-		Water.Draw( mini )
+		local sourceView = drawWorld( mini, options, false )
+		local drawEntities = ( Water.pass ~= "reflection" or not Water.sceneView or Water.sceneView.reflectEntities ~= false )
+			and ( Water.pass ~= "reflection" or not PocketMap.Settings or PocketMap.Settings.Enabled( mini, "water_reflect_entities" ) )
+		if drawEntities then
+			PocketMap.MapIO.Draw( mini, PocketMap.Materials.DrawOptions( options, mini.scale ), false )
+		end
+		local view = worldView( mini )
+		local pvs = worldPVS( mini, view )
+		if drawEntities and mini.ropeBatches then PocketMap.Ropes.Draw( mini, "opaque", nil, view, pvs, worldPartVisible ) end
+		if PocketMap.Decals then PocketMap.Decals.Draw( mini, nil, pvs ) end
 
-		if not lite then
-			if not Detail.Blends( mini ) then Detail.Draw( mini ) end
+		if not lite or Water.pass == "refraction" then
+			if not Detail.Blends( mini ) then Detail.Draw( mini, pvs ) end
+			if not lite or not PocketMap.Settings or PocketMap.Settings.Enabled( mini, "water_refract_props" ) then
+				Props.Draw( mini, "opaque", beginSourceView )
+			end
+		elseif Water.pass == "reflection" and Water.sceneView and Water.sceneView.reflectEntities
+			and PocketMap.Settings and PocketMap.Settings.Enabled( mini, "water_reflect_props" ) then
 			Props.Draw( mini, "opaque" )
 		end
+		-- Keep the water receiver and its terrain in the same projection.
+		Water.Draw( mini, sourceView and beginSourceView or nil )
 		-- Light opaque surfaces before translucent effects. Drawing this pass
 		-- over their quads erases the effects' transparency.
 		drawFlashlights( mini )
 	end
 
 	if doTranslucent then
-		Props.Draw( mini, "translucent" )
+		Props.Draw( mini, "translucent", beginSourceView )
+		local view = worldView( mini )
+		local pvs = worldPVS( mini, view )
 
 		-- A blended sprite sheet must not write depth, or the sprites would cut out what is behind them
 		if Detail.Blends( mini ) then
 			render.OverrideDepthEnable( true, false )
-			Detail.Draw( mini )
+			Detail.Draw( mini, pvs )
 			render.OverrideDepthEnable( true, true )
 		end
 
+		-- Source updates the power-of-two framebuffer before drawing its own
+		-- refractive surfaces. Pocket meshes need a copy after drawing the pocket.
+		if mini.hasRefractiveWorld and ( not PocketMap.Settings or PocketMap.Settings.Enabled( mini, "translucent_world" ) ) then
+			render.UpdatePowerOfTwoTexture()
+		end
 		drawWorld( mini, options, true )
-		PocketMap.MapIO.Draw(mini, PocketMap.Materials.DrawOptions(options, mini.scale), true)
-		local view = worldView( mini )
-		PocketMap.Effects.Draw( mini, worldPVS( mini, view ), view, worldPartVisible )
+		PocketMap.MapIO.Draw( mini, PocketMap.Materials.DrawOptions( options, mini.scale ), true )
+		if mini.ropeBatches then PocketMap.Ropes.Draw( mini, "translucent", nil, view, pvs, worldPartVisible ) end
+		PocketMap.Effects.Draw( mini, pvs, view, worldPartVisible )
 		render.OverrideDepthEnable( true, true )
 	end
+end
+
+local function drawWithFog( mini, options, pass )
+	local fog = PocketMap.Fog
+	if fog and Water.pass ~= "refraction" then
+		if options.preview then return fog.Draw( mini, nil, nil, nil, drawContents, mini, options, pass ) end
+		return fog.DrawWorld( mini, mini.scale, nil, drawContents, mini, options, pass )
+	end
+	-- Refraction owns its below-water fog and alpha for this pass.
+	drawContents( mini, options, pass )
 end
 
 function Mini:WaterDrawOptions()
 	return drawOptions( self )
 end
 
+function Mini:RequiresEngineView()
+	if PocketMap.Settings and PocketMap.Settings.MinimalPreview( self ) then return end
+	local flashlight = PocketMap.Flashlight
+	if flashlight and flashlight.IsOn() and ( not PocketMap.Settings or PocketMap.Settings.Enabled( self, "flashlight" ) ) then return "flashlight" end
+	local effects = PocketMap.Effects
+	local view = worldView( self )
+	if effects and effects.RequiresEngineView( self, worldPVS( self, view ), view, worldPartVisible ) then return "glow" end
+end
+
 ---The whole tiny map, both halves and no sky, in the current 3D view. The refraction and the reflection of the water use it.
 function Mini:DrawScene( options )
+	if self.entityRefresh then return end
 	self:UpdateMatrix()
 	render.OverrideDepthEnable( true, true )
-	drawContents( self, options, nil )
+	local preview = PocketMap.Settings and PocketMap.Settings.MinimalPreview( self )
+	drawWithFog( self, preview and previewOptions or options, nil )
 	render.OverrideDepthEnable( false )
 end
 
 ---@param pass "opaque"|"translucent"|nil
 function Mini:Draw( pass )
-	if self.state == "removed" or not self.scaleVec then return end
+	if self.entityRefresh or self.state == "removed" or not self.scaleVec then return end
 	if #self.objects == 0 and #self.propGroups == 0 and #self.detailMeshes == 0 then return end
 
 	self:UpdateMatrix()
 
 	local onScreen = not render.GetRenderTarget()
-	if self.waterPlanes and #self.waterPlanes > 0 and onScreen then Water.Calibrate() end
-
 	local options = drawOptions( self )
-	local sky = #self.skyObjects > 0 and onScreen and self:EyeInside()
-	local backdrop = self.skyBackdrop ~= nil and onScreen
+	if not options.preview and self.waterPlanes and #self.waterPlanes > 0 and onScreen then Water.Calibrate( self ) end
+	local sky = not options.preview and #self.skyObjects > 0 and onScreen and self:EyeInside()
+	local backdrop = not options.preview and self.skyBackdrop ~= nil and onScreen
 
-	local usesStencil = sky or backdrop
+	local sceneView = PocketMap.Scene and PocketMap.Scene.View( self )
+	local usesStencil = not sceneView and ( sky or backdrop )
 	if usesStencil and pass == "opaque" then return end
 	if usesStencil then
 		pass = nil
 		beginStencil()
 	end
 
-	if backdrop then Sky.DrawBackdrop( self ) end
-	if sky then Sky.Draw3D( self, options ) end
+	if backdrop and not sceneView then Sky.DrawBackdrop( self ) end
+	if sky and ( not sceneView or pass ~= "translucent" ) then Sky.Draw3D( self, options, sceneView ~= nil ) end
 
 	render.OverrideDepthEnable( true, true )
-	drawContents( self, options, pass )
+	drawWithFog( self, options, pass )
 	render.OverrideDepthEnable( false )
 
 	if usesStencil then render.SetStencilEnable( false ) end

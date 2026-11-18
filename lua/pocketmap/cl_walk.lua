@@ -13,14 +13,18 @@ function Walk.EyeOffset(session)
 	local ply = LocalPlayer()
 	local standing = ply:GetViewOffset()
 	local ducked = ply:GetViewOffsetDucked()
-	-- The view transition leads the collision-hull switch. Source retains
-	-- the old hull until the duck/unduck animation completes.
 	local target = not session.noclip and session.duckTarget and ducked or standing
 	local now = RealTime()
 	local current = session.viewOffset
 	if not current then
 		current = Vector(standing.x, standing.y, standing.z)
 		session.viewOffset = current
+	end
+
+	if session.duckViewInstant then
+		current.x, current.y, current.z = target.x, target.y, target.z
+		session.viewTarget = nil
+		return current
 	end
 
 	local function progress()
@@ -34,10 +38,6 @@ function Walk.EyeOffset(session)
 		current.x = Lerp(fraction, session.viewFrom.x, session.viewTarget.x)
 		current.y = Lerp(fraction, session.viewFrom.y, session.viewTarget.y)
 		current.z = Lerp(fraction, session.viewFrom.z, session.viewTarget.z)
-		if fraction >= 1 then
-			-- Source's duck flag becomes visible only after the transition ends.
-			session.crouchFlag = session.viewTarget:DistToSqr(ducked) < 0.001
-		end
 	end
 
 	if not session.viewTarget or session.viewTarget:DistToSqr(target) > 0.000001 then
@@ -57,6 +57,7 @@ end
 -- ground, stair, ladder and slide probe. Child indices < 0 encode leaf indices.
 function Session:QueryLeafs(lo, hi)
 	local result, stack = {}, { 0 }
+	local lx, ly, lz, hx, hy, hz = lo.x, lo.y, lo.z, hi.x, hi.y, hi.z
 	while #stack > 0 do
 		local index = stack[#stack]
 		stack[#stack] = nil
@@ -67,8 +68,9 @@ function Session:QueryLeafs(lo, hi)
 			local node = self.nodes[index]
 			if node then
 				local n, dist = node.plane.normal, node.plane.dist
-				local low = n.x * (n.x < 0 and hi.x or lo.x) + n.y * (n.y < 0 and hi.y or lo.y) + n.z * (n.z < 0 and hi.z or lo.z) - dist
-				local high = n.x * (n.x < 0 and lo.x or hi.x) + n.y * (n.y < 0 and lo.y or hi.y) + n.z * (n.z < 0 and lo.z or hi.z) - dist
+				local nx, ny, nz = n.x, n.y, n.z
+				local low = nx * (nx < 0 and hx or lx) + ny * (ny < 0 and hy or ly) + nz * (nz < 0 and hz or lz) - dist
+				local high = nx * (nx < 0 and lx or hx) + ny * (ny < 0 and ly or hy) + nz * (nz < 0 and lz or hz) - dist
 				if high >= -0.03125 then stack[#stack + 1] = node.children[1] end
 				if low <= 0.03125 then stack[#stack + 1] = node.children[2] end
 			end
@@ -86,6 +88,12 @@ end
 -- against its planes. The BSP partitions select brushes; render-leaf bounds
 -- must not reject player clips or brush sections extending beyond those bounds.
 function Session:TraceHull(start, finish, mins, maxs, mask, out)
+	-- Vector component access crosses the engine boundary. Read each input
+	-- once instead of doing that again for every side of every queried brush.
+	local sx, sy, sz = start.x, start.y, start.z
+	local ex, ey, ez = finish.x, finish.y, finish.z
+	local minX, minY, minZ = mins.x, mins.y, mins.z
+	local maxX, maxY, maxZ = maxs.x, maxs.y, maxs.z
 	out = out or {}
 	out.Fraction, out.Hit, out.StartSolid, out.AllSolid = 1, false, false, false
 	out.HitWorld, out.Entity = false, game.GetWorld()
@@ -93,8 +101,8 @@ function Session:TraceHull(start, finish, mins, maxs, mask, out)
 	out.Contents, out.SurfaceProps = 0, 0
 	out.Displacement = false
 	out.Texinfo, out.SurfaceName = nil, nil -- the surface that was hit, for the sound of a step: a texinfo, or the name of a surface property
-	local lo = {x = math.min(start.x, finish.x) + mins.x, y = math.min(start.y, finish.y) + mins.y, z = math.min(start.z, finish.z) + mins.z}
-	local hi = {x = math.max(start.x, finish.x) + maxs.x, y = math.max(start.y, finish.y) + maxs.y, z = math.max(start.z, finish.z) + maxs.z}
+	local lo = {x = math.min(sx, ex) + minX, y = math.min(sy, ey) + minY, z = math.min(sz, ez) + minZ}
+	local hi = {x = math.max(sx, ex) + maxX, y = math.max(sy, ey) + maxY, z = math.max(sz, ez) + maxZ}
 	local seen = {}
 	for _, leaf in ipairs(self:QueryLeafs(lo, hi)) do
 		for _, brush in ipairs(leaf:GetBrushes()) do
@@ -104,9 +112,10 @@ function Session:TraceHull(start, finish, mins, maxs, mask, out)
 				local outside, endOutside, rejected = false, false, false
 				for _, side in ipairs(brush.sides) do
 					local n, dist = side.plane.normal, side.plane.dist
-					local offset = n.x * (n.x < 0 and maxs.x or mins.x) + n.y * (n.y < 0 and maxs.y or mins.y) + n.z * (n.z < 0 and maxs.z or mins.z)
-					local d1 = n.x * start.x + n.y * start.y + n.z * start.z + offset - dist
-					local d2 = n.x * finish.x + n.y * finish.y + n.z * finish.z + offset - dist
+					local nx, ny, nz = n.x, n.y, n.z
+					local offset = nx * (nx < 0 and maxX or minX) + ny * (ny < 0 and maxY or minY) + nz * (nz < 0 and maxZ or minZ)
+					local d1 = nx * sx + ny * sy + nz * sz + offset - dist
+					local d2 = nx * ex + ny * ey + nz * ez + offset - dist
 					if d1 > 0 then outside = true end
 					if d2 > 0 then endOutside = true end
 					-- A clipped surf velocity is tangent to the plane. Double
@@ -140,7 +149,7 @@ function Session:TraceHull(start, finish, mins, maxs, mask, out)
 	PocketMap.MapIO.Trace(self, start, finish, mins, maxs, out)
 	out.Hit = out.Fraction < 1 or out.StartSolid
 	out.HitWorld = out.Hit
-	out.HitPos = {x = start.x + (finish.x - start.x) * out.Fraction, y = start.y + (finish.y - start.y) * out.Fraction, z = start.z + (finish.z - start.z) * out.Fraction}
+	out.HitPos = {x = sx + (ex - sx) * out.Fraction, y = sy + (ey - sy) * out.Fraction, z = sz + (ez - sz) * out.Fraction}
 	return out
 end
 
@@ -336,6 +345,8 @@ function Walk.ToggleNoclip()
 			chat.AddText("[PocketMap] Move out of the solid geometry before turning noclip off.")
 			return
 		end
+		session.ducking, session.duckTarget, session.crouchFlag = duck, duck, duck
+		session.duckViewInstant = true
 	end
 	session.noclip = not session.noclip
 	chat.AddText("[PocketMap] Noclip " .. (session.noclip and "on" or "off") .. ".")
@@ -477,6 +488,12 @@ function createMove(cmd)
 	local session = Walk.session
 	if not session then return end
 	local ply, mini = LocalPlayer(), session.mini
+	if mini.entityRefresh then
+		session.inputs = {}
+		cmd:ClearMovement()
+		cmd:ClearButtons()
+		return
+	end
 	if not IsValid(ply) or ply:InVehicle() or not IsValid(mini.ent) or mini.state ~= "ready" then Walk.Leave() return end
 	if not ply:Alive() then
 		session.waitingForRespawn, session.inputs = true, {}
@@ -531,12 +548,13 @@ end
 
 function setupMove(ply, _, cmd)
 	local session = Walk.session
-	if not session or ply ~= LocalPlayer() or not ply:Alive() or session.waitingForRespawn or PocketMap.GamemodeMovement.active then return end
+	if not session or session.mini.entityRefresh or ply ~= LocalPlayer() or not ply:Alive() or session.waitingForRespawn or PocketMap.GamemodeMovement.active then return end
 	runStep(ply, session, cmd, cmd:CommandNumber())
 end
 
 function Walk.View(fov, zfar)
 	local session = Walk.session
+	if session and session.mini.entityRefresh then return session.lastView end
 	if not session or not IsValid(session.mini.ent) or session.mini.state ~= "ready" then Walk.Leave() return end
 	local mini, mv = session.mini, session.move
 	local eye = mv.origin + Walk.EyeOffset(session)
@@ -547,7 +565,9 @@ function Walk.View(fov, zfar)
 	-- causing faces to flicker as the camera moves.
 	local near = math.max(0.001, mini.scale * 7)
 	PocketMap.Water.NoteView(origin, angles, fov, near, zfar)
-	return { origin = origin, angles = angles, fov = fov, znear = near, zfar = zfar, drawviewer = true }
+	local view = { origin = origin, angles = angles, fov = fov, znear = near, zfar = zfar, drawviewer = true }
+	session.lastView = view
+	return view
 end
 
 local function aimedBlock(ply)

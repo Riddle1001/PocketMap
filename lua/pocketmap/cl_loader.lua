@@ -105,7 +105,9 @@ local function readEntities( mini, job )
 	PocketMap.MapIO.Build( mini, job.entities )
 	PocketMap.Effects.Build( mini, job.entities )
 
+	if PocketMap.Fog then PocketMap.Fog.Read( mini ) end
 	PocketMap.Sky.Read( mini, job.entities )
+	PocketMap.Ropes.Build( mini, job )
 end
 
 ---Mostly the engine reading files, and a fast one costs next to nothing, so as many as possible are loaded in one frame:
@@ -115,10 +117,25 @@ local function loadMaterials( mini, job )
 	job.materials = {}
 
 	for i, key in ipairs( order ) do
-		mini:SetStatus( "Material " .. key, 0.05 + 0.1 * ( i - 1 ) / #order )
+		local brush = job.brushMaterials[key]
+		local name = brush and brush.name or key
+		mini:SetStatus( "Material " .. name, 0.05 + 0.1 * ( i - 1 ) / #order )
 
-		local material, seconds = PocketMap.Materials.Load( key )
+		local material, seconds = PocketMap.Materials.Load( name )
+		local refractive
+		material, refractive = PocketMap.Materials.ForPocketGlass( material, mini.packedCubemap )
+		if brush then material = PocketMap.Materials.ForBrush( material, brush.appearance ) end
+		if refractive then mini.hasRefractiveWorld = true end
 		job.materials[key] = material
+		-- Prepare the optional shader snapshots during the cooperative rebuild,
+		-- rather than compiling every newly visible material in a draw callback.
+		if PocketMap.Materials.ForWorld then
+			PocketMap.Materials.ForWorld( material, mini.scale, mini )
+			PocketMap.Materials.ForWorld( material, 1, mini )
+		end
+		if PocketMap.Settings and PocketMap.Settings.Enabled( mini, "minimal_preview" ) then
+			PocketMap.Materials.ForPreview( material )
+		end
 
 		mini.materialsLoaded = mini.materialsLoaded + 1
 		mini.slowestMaterial = math.max( mini.slowestMaterial, seconds )
@@ -139,7 +156,7 @@ local function allFaces( job )
 	for _, groups in ipairs( { job.groups, job.skyGroups } ) do
 		for _, list in pairs( groups ) do table.Add( faces, list ) end
 	end
-	for _, dynamic in pairs(job.dynamicFaces or {}) do table.Add(faces, dynamic) end
+	for _, dynamic in pairs( job.dynamicFaces or {} ) do table.Add( faces, dynamic ) end
 	return faces
 end
 
@@ -152,13 +169,15 @@ local function prepareLight( mini, job )
 
 	local ldr, hdr = hasLighting( bsp )
 	if ldr or hdr then
-		local useHDR = hdr and not ldr
+		local useHDR = hdr and ( not ldr or render.GetHDREnabled() )
 
 		mini:SetStatus( "Reading the lighting", 0.05 )
 		mini.lighting = useHDR and "HDR" or "LDR"
 		coroutine.yield()
 
-		local atlas, lightUV = PocketMap.Atlas.Build( mini, allFaces( job ), useHDR, cvLightToggle:GetBool() )
+		local toggle = cvLightToggle:GetBool()
+		if PocketMap.Settings then toggle = PocketMap.Settings.Compat( mini, "lighttoggle", cvLightToggle ) end
+		local atlas, lightUV = PocketMap.Atlas.Build( mini, allFaces( job ), useHDR, toggle )
 		if atlas then
 			mini.lightmapTexture = atlas
 			job.addOptions.lightUV = lightUV
@@ -227,34 +246,17 @@ end
 
 -- Every MeshBuilder part from this slice is enclosed by these real triangle
 -- bounds (including displacements and transformed brush models).
-local function buildSlice( list, first, last, addOptions )
-	local builder = NikNaks.MeshBuilder()
-	local minX, minY, minZ = math.huge, math.huge, math.huge
-	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
-
+local function buildSlice( list, first, last, addOptions, shadowMini )
+	local builder = NikNaks.MeshBuilder( true )
 	for i = first, last do
 		local face = list[i]
 		builder:AddFace( face, addOptions )
-		local vertices = face:GenerateVertexTriangleData()
-		if vertices then
-			for j = 1, #vertices do
-				local p = vertices[j].pos
-				if p then
-					minX, minY, minZ = math.min( minX, p.x ), math.min( minY, p.y ), math.min( minZ, p.z )
-					maxX, maxY, maxZ = math.max( maxX, p.x ), math.max( maxY, p.y ), math.max( maxZ, p.z )
-				end
-			end
-		end
+		if shadowMini then PocketMap.Flashlight.AddWorldShadowFace( shadowMini, face, addOptions.material ) end
 		if ( i - first ) % FACES_PER_YIELD == FACES_PER_YIELD - 1 then coroutine.yield() end
 	end
-
 	local object = builder:Build()
 	for i = first, last do list[i]:ClearMeshData() end
-	local mins, maxs
-	if minX < math.huge and maxX > -math.huge and minX == minX and maxX == maxX
-		and minY == minY and maxY == maxY and minZ == minZ and maxZ == maxZ then
-		mins, maxs = Vector( minX, minY, minZ ), Vector( maxX, maxY, maxZ )
-	end
+	local mins, maxs = object:GetBounds()
 	return object, mins, maxs
 end
 
@@ -284,44 +286,19 @@ end
 -- them), so their AABB alone is a poor way to identify the face's clusters.
 -- An unlinked face remains unknown and uses the conservative AABB fallback.
 local function worldFaceClusters( bsp )
-	local faceClusters = {}
-	local leafFaces = bsp:GetLeafFaces()
-	local processed = 0
-	for _, leaf in pairs( bsp:GetLeafs() ) do
-		local cluster = leaf.cluster
-		for index = leaf.firstleafface + 1, leaf.firstleafface + leaf.numleaffaces do
-			local faceId = leafFaces[index]
-			if faceId then
-				local clusters = faceClusters[faceId]
-				if cluster < 0 and bit.band( leaf.contents or 0, CONTENTS_SOLID ) == 0 then
-					faceClusters[faceId] = false
-				elseif cluster >= 0 and clusters ~= false then
-					if not clusters then
-						faceClusters[faceId] = { cluster }
-					else
-						local found = false
-						for i = 1, #clusters do
-							if clusters[i] == cluster then found = true break end
-						end
-						if not found then clusters[#clusters + 1] = cluster end
-					end
-				end
-			end
-		end
-		processed = processed + 1
-		if processed % 256 == 0 then coroutine.yield() end
+	local result, faces = {}, bsp:GetFaces()
+	for index, clusters in pairs( bsp:GetFaceClusters( coroutine.yield ) ) do
+		-- Brush models need transformed triangle bounds, not their model-space leaf links.
+		if faces[index] and faces[index]:IsWorld() then result[index] = clusters end
 	end
-	return faceClusters
+	return result
 end
 
--- Keep all clusters touched by the faces in this mesh. If even one face has
--- uncertain membership, reject by PVS only when its whole AABB is provably
--- in known leaves, preserving faces that cannot be mapped safely.
 local function sliceClusters( job, list, first, last, mins, maxs )
 	local clusters, seen = {}, {}
 	for i = first, last do
 		local face = list[i]
-		local linked = face:IsWorld() and job.faceClusters[face.__id]
+		local linked = job.faceClusters[face.__id]
 		if not linked or #linked == 0 then return worldClusters( job.bsp, mins, maxs ) end
 		for j = 1, #linked do
 			local cluster = linked[j]
@@ -340,8 +317,8 @@ local function buildMaterialGroups( mini, job, groups, order, out, isWorld, prog
 		local list = groups[key]
 		local material = job.materials[key]
 
-		-- Flat water surfaces get the effects of cl_water.lua, which need the atlas
-		if isWorld and mini.lightmapTexture and Water.IsWaterMaterial( material ) then
+		-- Water owns its receiver geometry even if the map has no lightmap atlas.
+		if isWorld and Water.IsWaterMaterial( material ) then
 			list = Water.Build( mini, key, material, list )
 		end
 
@@ -354,12 +331,27 @@ local function buildMaterialGroups( mini, job, groups, order, out, isWorld, prog
 		job.addOptions.material = material
 		local sliceSize = PocketMap.Faces.SLICE_SIZE
 		local facesPerMesh = isWorld and sliceSize * WORLD_SLICES_PER_MESH or sliceSize
-		local batches = isWorld and worldSpatialLists( list, material ) or { list }
+		local batches = { list }
+		if isWorld then
+			for i, face in ipairs( list ) do
+				PocketMap.Visibility.FaceClusters( mini, face )
+				if i % FACES_PER_YIELD == 0 then coroutine.yield() end
+			end
+			if material and NikNaks.MeshBuilder.BlendsWithBackground( material ) then
+				batches = PocketMap.Visibility.FaceBatches( mini, list )
+			else
+				batches = worldSpatialLists( list, material )
+			end
+		end
 		for _, batch in ipairs( batches ) do
+			if isWorld and material and not NikNaks.MeshBuilder.BlendsWithBackground( material ) then
+				mini.worldFaceGroups[#mini.worldFaceGroups + 1] = { material = material, faces = batch }
+			end
 			for first = 1, #batch, facesPerMesh do
-				mini:SetStatus( "Building " .. key, 0.15 + 0.45 * math.min( 1, progress.done / job.slicesTotal ) )
+				local source = job.brushMaterials[key]
+				mini:SetStatus( "Building " .. ( source and source.name or key ), 0.15 + 0.45 * math.min( 1, progress.done / job.slicesTotal ) )
 				local last = math.min( first + facesPerMesh - 1, #batch )
-				local object, mins, maxs = buildSlice( batch, first, last, job.addOptions )
+				local object, mins, maxs = buildSlice( batch, first, last, job.addOptions, isWorld and mini or nil )
 				out[#out + 1] = object
 				if isWorld then
 					local center, radius, clusters, blockCenter, blockRadius
@@ -377,6 +369,11 @@ local function buildMaterialGroups( mini, job, groups, order, out, isWorld, prog
 					for _, part in ipairs( object:GetMeshes() ) do
 						part.worldCenter, part.worldRadius, part.worldClusters = center, radius, clusters
 						part.blockCenter, part.blockRadius = blockCenter, blockRadius
+						-- Keep the real box as well as its enclosing sphere. Large,
+						-- thin surfaces otherwise straddle water clip planes by radius.
+						if mins and maxs then
+							part.blockExtents = ( maxs - mins ) * ( mini.scale * 0.5 ) + Vector( 8, 8, 8 ) * mini.scale
+						end
 						local drawList = part.translucent and out.translucentMeshes or out.opaqueMeshes
 						drawList[#drawList + 1] = part
 					end
@@ -396,8 +393,12 @@ local function buildWorldMeshes( mini, job )
 	mini.objects.opaqueMeshes = {}
 	mini.objects.translucentMeshes = {}
 	job.faceClusters = worldFaceClusters( job.bsp )
+	mini.worldFaceGroups = {}
+	mini.worldFaceClusters = job.faceClusters
+	mini.worldLightUV = job.addOptions.lightUV
 
 	buildMaterialGroups( mini, job, job.groups, job.order, mini.objects, true, progress )
+	PocketMap.Flashlight.FlushWorldShadows( mini )
 	if mini.lightmapTexture then buildMaterialGroups( mini, job, job.skyGroups, job.skyOrder, mini.skyObjects, false, progress ) end
 
 	job.faceClusters = nil
@@ -408,9 +409,9 @@ end
 local function mountPackedAssetsIfPossible( mini, job )
 	mini:SetStatus( "Mounting packed assets", 0.01 )
 
-	local ok, result = pcall( PocketMap.Pak.Mount, job.bsp, coroutine.yield )
+	local ok, result, cubemap = pcall( PocketMap.Pak.Mount, job.bsp, coroutine.yield )
 	if ok then
-		mini.packedAssets = result
+		mini.packedAssets, mini.packedCubemap = result, cubemap
 	else
 		print( "[PocketMap] " .. mini.mapName .. ": the packed assets were not mounted (" .. tostring( result ) .. ")" )
 	end
@@ -431,9 +432,17 @@ function Loader.Run( mini )
 	prepareLight( mini, job )
 	PocketMap.MapIO.BuildMeshes( mini, job )
 	buildWorldMeshes( mini, job )
+	mini:SetStatus( "Projecting map decals", 0.6 )
+	if PocketMap.Decals then PocketMap.Decals.Build( mini, job ) end
 	PocketMap.Props.Collect( mini, job )
 	PocketMap.Detail.Build( mini, job )
-	PocketMap.Props.Place( mini, job, cvLightToggle:GetBool(), cvPropMeshes:GetBool() )
+	local lightToggle, bake = cvLightToggle:GetBool(), cvPropMeshes:GetBool()
+	if PocketMap.Settings then
+		lightToggle = PocketMap.Settings.Compat( mini, "lighttoggle", cvLightToggle )
+		bake = PocketMap.Settings.Compat( mini, "baked_models", cvPropMeshes )
+	end
+	PocketMap.Props.Place( mini, job, lightToggle, bake )
+	PocketMap.MapIO.PrepareDoorProps( mini )
 
 	mini.state = "ready"
 	mini:SetStatus( "", 1 )

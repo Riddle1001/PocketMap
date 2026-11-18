@@ -188,7 +188,7 @@ local function stopWalker( ply )
 	if not walker then return end
 
 	walkers[ply] = nil
-	if PocketMap.FlashlightServer then PocketMap.FlashlightServer.Stop(ply) end
+	if PocketMap.FlashlightServer then PocketMap.FlashlightServer.Stop( ply ) end
 	if IsValid( walker.block ) then
 		refreshRecipients( walker )
 		relayWalker( walker, false )
@@ -238,7 +238,7 @@ local function trackedWalker( ply, block )
 	walker = { ply = ply, index = ply:EntIndex(), block = block, recipients = {}, nextRecipientRefresh = 0,
 		returnPosition = block:WorldToLocal( ply:GetPos() ) }
 	walkers[ply] = walker
-	if PocketMap.FlashlightServer then PocketMap.FlashlightServer.Start(ply) end
+	if PocketMap.FlashlightServer then PocketMap.FlashlightServer.Start( ply ) end
 	if wasIdle then installWalkerHooks() end
 	return walker
 end

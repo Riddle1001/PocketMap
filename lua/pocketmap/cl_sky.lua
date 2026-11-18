@@ -3,13 +3,16 @@
 
 if not PocketMap.Mini then return end
 
-PocketMap.Sky = {}
+PocketMap.Sky = PocketMap.Sky or {}
 local Sky = PocketMap.Sky
 local Entities = PocketMap.Entities
+local IO = PocketMap.MapIO
 
 local SIDES = { "ft", "bk", "lf", "rt", "up", "dn" }
 local CUBE_SIZE = 1024
 local DEFAULT_SKYBOX_SCALE = 16
+local DEFAULT_SUN_MATERIAL = "sprites/light_glow02_add_noz"
+local SUN_UP = Vector( 0, 0, 1 )
 local STENCIL_MAP = 1
 local STENCIL_BLOCK = 2
 
@@ -103,21 +106,67 @@ end
 
 -- Loading -------------------------------------------------------------------------------------------------------------
 
+local function sunColor( value, fallback )
+	if IsColor( value ) then return Vector( value.r, value.g, value.b ) end
+	return vectorOf( value, fallback )
+end
+
+local function sunDirection( world, record )
+	local yaw = IO.Number( record.entity, "angle", 0 )
+	local pitch = IO.Number( record.entity, "pitch", 0 )
+	if IO.Number( record.entity, "use_angles", 0 ) ~= 0 then
+		if yaw == -1 or yaw == -2 then return yaw == -1 and -SUN_UP or SUN_UP end
+		return -Angle( -( pitch ~= 0 and pitch or record.angles.p ), yaw ~= 0 and yaw or record.angles.y, 0 ):Forward()
+	end
+	local name = IO.Value( record.entity, "target" )
+	local targets = type( name ) == "string" and world.names[name:lower()]
+	if targets and targets[1].origin ~= record.origin then return ( record.origin - targets[1].origin ):GetNormalized() end
+	return SUN_UP
+end
+
+local function readSuns( mini )
+	local suns = {}
+	for _, record in ipairs( IO.OfClass( mini.mapIO, "env_sun" ) ) do
+		local entity = record.entity
+		local size = math.max( 0, IO.Number( entity, "size", 16 ) )
+		local overlaySize = IO.Number( entity, "overlaysize", -1 )
+		suns[#suns + 1] = {
+			order = record.order, direction = sunDirection( mini.mapIO, record ),
+			color = sunColor( entity.rendercolor or IO.Value( entity, "rendercolor" ), Vector( 255, 255, 255 ) ),
+			overlayColor = sunColor( IO.Value( entity, "overlaycolor" ), vector_origin ),
+			material = PocketMap.Materials.Load( IO.Value( entity, "material" ) or DEFAULT_SUN_MATERIAL ),
+			overlay = PocketMap.Materials.Load( IO.Value( entity, "overlaymaterial" ) or DEFAULT_SUN_MATERIAL ),
+			size = size, overlaySize = overlaySize < 0 and size or overlaySize,
+			hdrScale = IO.Number( entity, "hdrcolorscale", 1 ),
+		}
+	end
+	mini.skySuns = suns
+end
+
+IO.Register( "env_sun", {
+	turnon = function( state, record ) IO.State( state, record ).enabled = true end,
+	turnoff = function( state, record ) IO.State( state, record ).enabled = false end,
+	setcolor = function( state, record, value ) IO.State( state, record ).sunColor = sunColor( value ) end,
+} )
+
 ---Sets mini.skyBackdrop (side -> material, nil if a side is missing), mini.skyPaint and mini.skyName.
 function Sky.Read( mini, entities )
+	readSuns( mini )
 	local skyName = Entities.First( entities[0] and entities[0].skyname )
 	if type( skyName ) ~= "string" or skyName == "" then return end
 
 	mini:SetStatus( "Reading the sky", 0.035 )
 
-	local backdrop = {}
+	local backdrop, directional = {}, false
 	for _, side in ipairs( SIDES ) do
 		local material = PocketMap.Materials.Load( "skybox/" .. skyName .. side )
 		if material:IsError() then backdrop = nil break end
 		backdrop[side] = material
+		if material:GetShader():match( "^WindowImposter" ) then directional = true end
 	end
 
 	mini.skyBackdrop = backdrop
+	mini.skyDirectional = directional
 	mini.skyName = skyName
 	if backdrop and skyName:lower() == "painted" then mini.skyPaint = readPaint( entities ) end
 	coroutine.yield()
@@ -215,14 +264,14 @@ local function drawSide( mini, side, material )
 	end
 end
 
----A painted sky expects the cube at the origin seen by a camera at the origin, which is how the engine draws the 2D sky.
-local function startPaintedCamera( override )
+---Directional skies sample the camera and vertices in shader world space.
+local function startSkyCamera( override, angles )
 	local view = render.GetViewSetup()
 
 	if override then
-		cam.Start3D( vector_origin, override.angles, override.fov, 0, 0, override.w, override.h, view.znear, view.zfar )
+		cam.Start3D( vector_origin, angles, override.fov, 0, 0, override.w, override.h, view.znear, view.zfar )
 	else
-		cam.Start3D( vector_origin, view.angles, view.fov, view.x, view.y, view.width, view.height, view.znear, view.zfar )
+		cam.Start3D( vector_origin, angles, view.fov, view.x, view.y, view.width, view.height, view.znear, view.zfar )
 	end
 	cam.IgnoreZ( true )
 end
@@ -237,15 +286,68 @@ local function pushCubeMatrix( mini, eye )
 	cam.PushModelMatrix( matrix )
 end
 
+local function sunVisible( mini, sun, eye )
+	if PocketMap.Water and PocketMap.Water.pass then return true end
+	local origin = mini.mapCenter + ( mini.ent:WorldToLocal( eye ) - mini.boxCenter ) / mini.scale
+	if not sun.traceEye or ( sun.traceEye:DistToSqr( origin ) > 64 and RealTime() >= sun.traceAt ) then
+		local trace = mini.bsp:SurfaceTraceLine( origin, origin + sun.direction * 32768 )
+		sun.traceEye, sun.traceAt = origin, RealTime() + 0.1
+		sun.visible = not trace.Hit or trace.HitSky
+	end
+	return sun.visible
+end
+
+local function sunLayer( material, size, center, right, up, tint, brightness )
+	if size <= 0 or brightness <= 0 or material:IsError() then return end
+	right, up = right * size, up * size
+	local color = Color( math.Clamp( tint.x * brightness, 0, 255 ), math.Clamp( tint.y * brightness, 0, 255 ),
+		math.Clamp( tint.z * brightness, 0, 255 ) )
+	render.SetMaterial( material )
+	render.DrawQuad( center - right + up, center + right + up, center + right - up, center - right - up, color )
+end
+
+local function drawSuns( mini, eye, angles )
+	local walk = PocketMap.Walk and PocketMap.Walk.session
+	local state = walk and walk.mini == mini and walk.io
+	local world = state and state.world or mini.mapIO
+	local forward = angles:Forward()
+	for _, sun in ipairs( mini.skySuns or {} ) do
+		local record = world.entities[sun.order]
+		local facing = sun.direction:Dot( forward )
+		if facing > 0 and record and record.class == "env_sun" and IO.Enabled( state, record ) and sunVisible( mini, sun, eye ) then
+			local right = sun.direction:Cross( SUN_UP )
+			if right:LengthSqr() < 0.0001 then right = angles:Right() else right:Normalize() end
+			local up = right:Cross( sun.direction )
+			local authored = state and state.records[record] and state.records[record].sunColor or sun.color
+			local peak = math.max( authored.x, authored.y, authored.z )
+			local core = peak > 0 and authored * ( 255 / peak ) or Vector( 255, 255, 255 )
+			local glow = sun.overlayColor:LengthSqr() > 0 and sun.overlayColor or core
+			local hdrScale = render.GetHDREnabled() and sun.hdrScale or 1
+			local center = sun.direction * 100
+			sunLayer( sun.material, sun.size, center, right, up, core, hdrScale )
+			sunLayer( sun.overlay, sun.overlaySize * 6, center, right, up, glow,
+				hdrScale * math.Clamp( ( facing - 0.9 ) * 7.5, 0, 0.75 ) )
+		end
+	end
+end
+
 ---The six sides as a cube around a point, turned the way the map is.
 ---@param eye Vector
 ---@param override table? # { angles, fov, w, h }: a view that is not the main one (the water draws the sky in the mirrored view)
-function Sky.DrawCube( mini, eye, override )
+local function drawCube( mini, eye, override )
 	local backdrop = mini.skyBackdrop
 	if not backdrop then return end
 
 	local paint = mini.skyPaint
-	if paint then startPaintedCamera( override ) else pushCubeMatrix( mini, eye ) end
+	local useSkyCamera = paint or mini.skyDirectional
+	local hasSuns = mini.skySuns and #mini.skySuns > 0
+	local viewAngles = ( useSkyCamera or hasSuns ) and ( override and override.angles or render.GetViewSetup().angles )
+	if useSkyCamera then
+		local angles = mini.skyDirectional and mini.ent:WorldToLocalAngles( viewAngles ) or viewAngles
+		startSkyCamera( override, angles )
+	else
+		pushCubeMatrix( mini, eye )
+	end
 
 	-- The sky materials have $ignorez, so they are painted over whatever is there. What is in the block is not in the mask and is not painted over.
 	render.OverrideDepthEnable( true, false )
@@ -258,16 +360,29 @@ function Sky.DrawCube( mini, eye, override )
 		if paint then applyPaint( backdrop[side], paint ) end
 		drawSide( mini, side, backdrop[side] )
 	end
+	-- The sun belongs to the backdrop, behind both the sky room and the map.
+	if hasSuns then
+		if paint then pushCubeMatrix( mini, vector_origin ) end
+		drawSuns( mini, eye, mini.ent:WorldToLocalAngles( viewAngles ) )
+		if paint then cam.PopModelMatrix() end
+	end
 
 	if paint then g_SkyPaint = hostSkyPaint end
 	render.OverrideDepthEnable( false )
 
-	if paint then
+	if useSkyCamera then
 		cam.IgnoreZ( false )
 		cam.End3D()
 	else
 		cam.PopModelMatrix()
 	end
+end
+
+function Sky.DrawCube( mini, eye, override )
+	if not mini.skyBackdrop then return end
+	local fog = PocketMap.Fog
+	if fog then return fog.Draw( mini, nil, nil, nil, drawCube, mini, eye, override ) end
+	drawCube( mini, eye, override )
 end
 
 -- The stencil -----------------------------------------------------------------------------------------------------------
@@ -330,25 +445,47 @@ local function updateSkyMatrix( mini )
 	return matrix
 end
 
+local function drawSkyContents( mini, matrix, options, world, props, decals )
+	local objects = mini.skyObjects
+	if world then for i = 1, #objects do objects[i]:DrawOpaque( matrix, options ) end end
+	if props then PocketMap.Props.DrawSky( mini, matrix, "opaque" ) end
+	if props and mini.ropeBatches then PocketMap.Ropes.Draw( mini, "skyOpaque", matrix ) end
+	if decals and PocketMap.Decals then PocketMap.Decals.Draw( mini, matrix ) end
+	if world then for i = 1, #objects do objects[i]:DrawTranslucent( matrix, options ) end end
+	render.OverrideDepthEnable( true, true )
+	if props then PocketMap.Props.DrawSky( mini, matrix, "translucent" ) end
+	if props and mini.ropeBatches then PocketMap.Ropes.Draw( mini, "skyTranslucent", matrix ) end
+end
+
 ---The 3D skybox, for an eye inside the block. A point S of the sky room is at skyScale * ( S - sky origin ) from the origin of the map,
 ---as the engine draws it for someone standing in the map. It is drawn after the 2D sky and before the map, which is always in front of it.
 ---@param options table # the draw options of the world meshes
-function Sky.Draw3D( mini, options )
+function Sky.Draw3D( mini, options, wholeView )
+	local world = not PocketMap.Settings or PocketMap.Settings.Enabled( mini, "sky_world" )
+	local props = not PocketMap.Settings or PocketMap.Settings.Enabled( mini, "sky_props" )
+	local decals = not PocketMap.Settings or PocketMap.Settings.Enabled( mini, "sky_decals" )
+	if not world and not props and not decals then return end
 	local objects = mini.skyObjects
-	if #objects == 0 or not mini.skyOrigin then return end
+	if not mini.skyOrigin then return end
+	local ropes = mini.ropeBatches
+	local hasSkyRopes = props and ropes and ( #ropes.skyOpaque > 0 or #ropes.skyTranslucent > 0 )
+	if #objects == 0 and not hasSkyRopes then return end
 
 	local matrix = updateSkyMatrix( mini )
-	options = PocketMap.Materials.DrawOptions(options, matrix:GetScale().x)
+	options = PocketMap.Materials.DrawOptions( options, matrix:GetScale().x )
 
-	maskBlock( mini )
+	if not wholeView then maskBlock( mini ) end
 	render.OverrideDepthEnable( true, true )
-	for i = 1, #objects do objects[i]:DrawOpaque( matrix, options ) end
-	PocketMap.Props.DrawSky( mini, matrix, "opaque" )
-	for i = 1, #objects do objects[i]:DrawTranslucent( matrix, options ) end
-	render.OverrideDepthEnable( true, true )
-	PocketMap.Props.DrawSky( mini, matrix, "translucent" )
+	local fog = PocketMap.Fog
+	if fog then
+		-- Sky fog distances are authored in world units. The sky matrix has
+		-- already expanded the sky room by skyScale.
+		fog.Draw( mini, mini.skyFog, mini.scale, nil, drawSkyContents, mini, matrix, options, world, props, decals )
+	else
+		drawSkyContents( mini, matrix, options, world, props, decals )
+	end
 
-	clearDepthInMask()
+	if wholeView then render.ClearDepth() else clearDepthInMask() end
 	render.OverrideDepthEnable( false )
-	stencilForTheMap()
+	if not wholeView then stencilForTheMap() end
 end

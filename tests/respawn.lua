@@ -100,6 +100,16 @@ assert(fresh.io == old.io and fresh.io.queue[1] == "door output" and next(fresh.
 assert(messages[#messages].active == true and messages[#messages].block == block, "respawn was not relayed")
 dofile("lua/pocketmap/cl_walk.lua")
 assert(Walk.session == fresh and type(hooks.CreateMove.PocketMap_Walk) == "function", "refresh failed to retain respawned walk")
+mini.entityRefresh = {}
+block.valid = false
+fresh.inputs, fresh.lastView = {[50]=true}, {origin='last pocket view'}
+cmd.movementCleared, cmd.buttonsCleared = false, false
+move()
+hooks.SetupMove.PocketMap_Walk(ply, nil, cmd)
+assert(Walk.session==fresh and next(fresh.inputs)==nil and cmd.movementCleared and cmd.buttonsCleared,
+	"network refresh ejected the player, advanced movement, or kept stale input")
+assert(Walk.View(90,30000)==fresh.lastView,"network refresh lost the frozen camera")
+mini.entityRefresh, block.valid = nil, true
 Walk.Leave()
 assert(not Walk.session and messages[#messages].active == false, "explicit leave failed")
 receivers.PocketMap_Respawn()

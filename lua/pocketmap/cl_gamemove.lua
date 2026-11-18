@@ -42,7 +42,7 @@ function Bridge.Step(ply, mv, cmd, session)
 	local function flags()
 		local value = bit.band(realFlags, bit.bnot(flagsMask))
 		if session.onground then value = bit.bor(value, FL_ONGROUND) end
-		if session.crouchFlag then value = bit.bor(value, FL_DUCKING) end
+		if session.crouchFlag then value = bit.bor( value, FL_DUCKING ) end
 		return value
 	end
 	local virtual = {
@@ -60,8 +60,8 @@ function Bridge.Step(ply, mv, cmd, session)
 		WaterType = function() return session.waterType or 0 end,
 		EyeAngles = function() return mv:GetAngles() end,
 		GetAimVector = function() return mv:GetAngles():Forward() end,
-		EyePos = function() return mv:GetOrigin() + PocketMap.Walk.EyeOffset(session) end,
-		GetCurrentViewOffset = function() return PocketMap.Walk.EyeOffset(session) end,
+		EyePos = function() return mv:GetOrigin() + PocketMap.Walk.EyeOffset( session ) end,
+		GetCurrentViewOffset = function() return PocketMap.Walk.EyeOffset( session ) end,
 		KeyDown = function(_, key) return mv:KeyDown(key) end,
 		KeyPressed = function(_, key) return mv:KeyPressed(key) end,
 		KeyReleased = function(_, key) return mv:KeyReleased(key) end,

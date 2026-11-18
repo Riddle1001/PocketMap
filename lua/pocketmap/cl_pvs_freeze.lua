@@ -35,8 +35,7 @@ concommand.Add( "pocketmap_pvs_freeze", function()
 		return
 	end
 
-	local height = not walk.noclip and bit.band( walk.move.buttons, IN_DUCK ) ~= 0 and 28 or 64
-	local eye = walk.move.origin + Vector( 0, 0, height )
+	local eye = walk.move.origin + PocketMap.Walk.EyeOffset( walk )
 	local bsp = mini.bsp
 	local cluster = bsp:ClusterFromPoint( eye )
 	local vis = cluster and cluster >= 0 and bsp:GetVisibility()
@@ -45,15 +44,18 @@ concommand.Add( "pocketmap_pvs_freeze", function()
 		return
 	end
 
-	local pvs = bsp:PVSForOrigin( eye )
+	-- Keep the already compiled world cache when freezing the current cluster.
+	-- A new but equivalent table would unnecessarily start another mesh build.
+	local pvs = mini.worldPVSBSP == bsp and mini.worldPVSCluster == cluster and mini.worldPVS
+		or bsp:PVSForOrigin( eye )
 	if not pvs then
 		report( "Could not read the BSP PVS at this position." )
 		return
 	end
 
 	local count = 0
-	for _, visible in pairs( pvs ) do
-		if visible then count = count + 1 end
+	for clusterId, visible in pairs( pvs ) do
+		if type( clusterId ) == "number" and visible then count = count + 1 end
 	end
 	Freeze.state = { mini = mini, bsp = bsp, eye = Vector( eye.x, eye.y, eye.z ),
 		cluster = cluster, pvs = pvs, clusters = count }
@@ -67,8 +69,7 @@ PocketMap.Hooks.Register( "HUDPaint", "PocketMap_PVSFreeze", function()
 	-- The BSP lookup is useful feedback but needn't run on every rendered frame.
 	if RealTime() >= ( state.nextHUDUpdate or 0 ) then
 		local walk = PocketMap.Walk.session
-		local height = not walk.noclip and bit.band( walk.move.buttons, IN_DUCK ) ~= 0 and 28 or 64
-		state.liveCluster = state.bsp:ClusterFromPoint( walk.move.origin + Vector( 0, 0, height ) )
+		state.liveCluster = state.bsp:ClusterFromPoint( walk.move.origin + PocketMap.Walk.EyeOffset( walk ) )
 		state.nextHUDUpdate = RealTime() + 0.15
 	end
 	local liveCluster = state.liveCluster
