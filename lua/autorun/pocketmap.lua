@@ -60,7 +60,6 @@ local CLIENT_FILES = {
 	"pocketmap/cl_footsteps.lua",
 	"pocketmap/cl_walk.lua",
 	"pocketmap/cl_compare.lua",
-	"pocketmap/cl_note.lua",
 	"pocketmap/cl_walkers.lua",
 }
 
