@@ -5,6 +5,7 @@ if not PocketMap.Mini then return end
 PocketMap.PropLight = PocketMap.PropLight or {}
 local PropLight = PocketMap.PropLight
 PropLight.__index = PropLight
+local renderVersion = {}
 
 local NORMALS = { Vector( 1, 0, 0 ), Vector( -1, 0, 0 ), Vector( 0, 1, 0 ), Vector( 0, -1, 0 ), Vector( 0, 0, 1 ), Vector( 0, 0, -1 ) }
 local GRAY_CUBE = {}
@@ -30,7 +31,7 @@ function PropLight.Prepare( bsp, hdr )
 	worldLights( bsp, hdr )
 end
 
-function PropLight.New( mini, bsp, lightToggle )
+function PropLight.New( mini, bsp, lightToggle, vertexLights )
 	local lights = {}
 	for _, light in pairs( worldLights( bsp, mini.lighting == "HDR" ) ) do
 		-- Small surface emitters are already included in the ambient cube by VRAD.
@@ -38,7 +39,7 @@ function PropLight.New( mini, bsp, lightToggle )
 			and ( lightToggle or light.style == 0 ) then lights[#lights + 1] = light end
 	end
 	return setmetatable( { bsp = bsp, mini = mini, hdr = mini.lighting == "HDR",
-		lights = lights, leafCubes = {}, modelInfo = {} }, PropLight )
+		lights = lights, leafCubes = {}, modelInfo = {}, vertexLights = vertexLights, modelChecksums = {} }, PropLight )
 end
 
 function PropLight:Position( prop, model )
@@ -60,7 +61,7 @@ function PropLight:AmbientCube( at )
 	if #samples == 0 then return GRAY_CUBE end
 	local single, id = #samples == 1, leaf:GetIndex()
 	if single and self.leafCubes[id] then return self.leafCubes[id] end
-	local colors = leaf:CalculateAmbientCube( at, self.hdr )
+	local colors = leaf:CalculateAmbientCubeLinear( at, self.hdr )
 	if not colors then return GRAY_CUBE end
 	local cube = {}
 	for side = 1, 6 do
@@ -136,6 +137,25 @@ function PropLight:Of( prop, model, pause )
 		for side = 1, 6 do light[side] = Vector( 1, 1, 1 ) end
 		return light
 	end
+	local baked = self.vertexLights and self.vertexLights[prop.StaticIndex]
+	if baked and model then
+		local checksum = self.modelChecksums[model]
+		if checksum == nil then
+			local mdl = file.Open( model, "rb", "GAME" )
+			if mdl then
+				mdl:Seek( 8 )
+				checksum = mdl:ReadULong()
+				mdl:Close()
+			end
+			checksum = checksum or false
+			self.modelChecksums[model] = checksum
+		end
+		if checksum == baked.checksum then
+			local cube = {}
+			for side = 1, 6 do cube[side] = baked.color end
+			return { at = at, baked = { cube = cube, uniform = baked.color, direct = EMPTY_DIRECT }, vertexLight = baked }
+		end
+	end
 	local ambient = self:AmbientCube( at )
 	local light = { at = at, direct = self:DirectLights( at, pause ), mini = self.mini }
 	for side = 1, 6 do light[side] = ambient[side] end
@@ -169,6 +189,7 @@ local function rotateCube( cube, normals )
 end
 
 function PropLight.ForRender( light, transform )
+	if light.baked then return light.baked end
 	local styles = light.mini and light.mini.lightStyles
 	local sources = light.direct or EMPTY_DIRECT
 	local animated = false
@@ -180,7 +201,8 @@ function PropLight.ForRender( light, transform )
 	local tick = animated and PocketMap.LightStyles.CurrentTick() or 0
 	local uniform = light.fullbright or light.mini and PocketMap.Settings and not PocketMap.Settings.Enabled( light.mini, "directional_prop_ambient" ) or false
 	local cached = light.rendered
-	if cached and cached.system == PropLight and cached.transform == transform and cached.tick == tick and ( cached.uniform ~= nil ) == uniform then return cached end
+	if cached and cached.version == renderVersion and cached.transform == transform and cached.tick == tick
+		and ( cached.uniform ~= nil ) == uniform then return cached end
 	local cube, average
 	if uniform then
 		if not light.uniformCube then
@@ -223,7 +245,7 @@ function PropLight.ForRender( light, transform )
 			angularFalloff = source.exponent,
 		}
 	end
-	cached = { system = PropLight, transform = transform, tick = tick, cube = cube, direct = direct, uniform = average }
+	cached = { system = PropLight, version = renderVersion, transform = transform, tick = tick, cube = cube, direct = direct, uniform = average }
 	light.rendered = cached
 	return cached
 end

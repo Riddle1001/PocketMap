@@ -41,9 +41,9 @@ You start at a random player spawn of the map. Your noclip key (default V) or `p
 
 ## Requirements
 
-- [NikNaks](https://github.com/Nak2/NikNaks) 0.99 or newer (the matching changes are proposed in [NikNaks #24](https://github.com/Nak2/NikNaks/pull/24); not yet an upstream release)
+- [NikNaks](https://github.com/Nak2/NikNaks) with the BSP and lighting changes from [NikNaks #24](https://github.com/Nak2/NikNaks/pull/24)
 
-Update both add-ons together and restart after updating NikNaks. The 0.99 dependency includes directional lightmap coordinates, native lightmap color conversion, material binding callbacks, and linear ambient irradiance. An older library can accept the extra Lua arguments while silently rendering different results.
+Update both add-ons together and restart after updating NikNaks. PocketMap checks for the entity and linear ambient lighting APIs at startup.
 
 ## Supported map I/O
 

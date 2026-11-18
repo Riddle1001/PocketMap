@@ -10,6 +10,7 @@ local PropMesh = PocketMap.PropMesh
 local LODS = { 2, 1, 0 }
 local MAX_VERTICES = 30000
 local CUTOUT_REFERENCE = 0.5
+local MIN_BAKED_DETAIL_BLEND = 0.125
 local MATERIAL_VAR_NOCULL = 0x2000
 local MATERIAL_VAR_ADDITIVE = 0x80
 local MATERIAL_VAR_TRANSLUCENT = 0x200000
@@ -69,7 +70,7 @@ local function readTriangles( path, skin )
 	end
 end
 
-local function buildMesh( material, triangles, first, last )
+local function buildMesh( material, triangles, first, last, colors )
 	local meshObject = Mesh( material )
 
 	mesh.Begin( meshObject, MATERIAL_TRIANGLES, ( last - first + 1 ) / 3 )
@@ -92,7 +93,8 @@ local function buildMesh( material, triangles, first, last )
 		mesh.Normal( vertex.normal )
 		if tangent and binormal then mesh.TangentS( tangent ) mesh.TangentT( binormal ) end
 		mesh.TexCoord( 0, vertex.u, vertex.v )
-		mesh.Color( 255, 255, 255, 255 )
+		local color = colors and colors[vertex]
+		if color then mesh.Color( color[1], color[2], color[3], 255 ) else mesh.Color( 255, 255, 255, 255 ) end
 		mesh.AdvanceVertex()
 	end
 	mesh.End()
@@ -101,12 +103,12 @@ local function buildMesh( material, triangles, first, last )
 end
 
 ---@param parts table # collects { material, mesh, translucent }, and the flags hasOpaque / hasTranslucent
-local function addPart( parts, material, triangles )
+local function addPart( parts, material, triangles, colors )
 	local translucent = NikNaks.MeshBuilder.BlendsWithBackground( material )
 
 	for first = 1, #triangles, MAX_VERTICES do
 		local last = math.min( first + MAX_VERTICES - 1, #triangles )
-		parts[#parts + 1] = { material = material, mesh = buildMesh( material, triangles, first, last ), translucent = translucent }
+		parts[#parts + 1] = { material = material, mesh = buildMesh( material, triangles, first, last, colors ), translucent = translucent }
 	end
 
 	if translucent then parts.hasTranslucent = true else parts.hasOpaque = true end
@@ -126,6 +128,90 @@ function PropMesh.Build( path, skin )
 	end
 
 	return #parts > 0 and parts or nil
+end
+
+local litMaterials = setmetatable( {}, { __mode = "k" } )
+
+local function vertexLightMaterial( material )
+	if litMaterials[material] then return litMaterials[material] end
+	if material:GetShader() ~= "VertexLitGeneric" or NikNaks.MeshBuilder.BlendsWithBackground( material ) then return end
+	local texture = material:GetTexture( "$basetexture" )
+	if not texture or texture:IsError() then return end
+
+	-- VertexLitGeneric accepts studio lighting through a separate stream.
+	-- Lua meshes can supply its baked diffuse light through UnlitGeneric's
+	-- vertex color input while retaining the authored base and cutout.
+	local source = PocketMap.Materials.ReadVMT( material:GetName() ) or {}
+	local values = {
+		["$vertexcolor"] = 1, ["$model"] = 1, ["$basetexture"] = texture:GetName(),
+		["$basetexturetransform"] = source["$basetexturetransform"],
+		["$alphatest"] = bit.band( material:GetInt( "$flags" ) or 0, 0x100 ) ~= 0 and 1 or 0,
+		["$alphatestreference"] = source["$alphatestreference"],
+		["$nocull"] = bit.band( material:GetInt( "$flags" ) or 0, MATERIAL_VAR_NOCULL ) ~= 0 and 1 or 0,
+		["$nofog"] = source["$nofog"], Proxies = source.proxies,
+	}
+	local detailMode = tonumber( source["$detailblendmode"] ) or 0
+	local detailBlend = tonumber( source["$detailblendfactor"] ) or 1
+	-- The unlit mesh shader can exaggerate faint modulated detail into visible
+	-- stipple. For that range, the base texture gives a closer diffuse match.
+	if source["$detail"] and ( detailMode ~= 0 or detailBlend > MIN_BAKED_DETAIL_BLEND or source.proxies ) then
+		values["$detail"] = source["$detail"]
+		values["$detailblendfactor"] = detailBlend
+		values["$detailscale"] = source["$detailscale"]
+		values["$detailblendmode"] = detailMode
+	end
+	local tint = material:GetVector( "$color" ) or Vector( 1, 1, 1 )
+	local tint2 = material:GetVector( "$color2" ) or Vector( 1, 1, 1 )
+	values["$color"] = string.format( "[%g %g %g]", tint.x * tint2.x, tint.y * tint2.y, tint.z * tint2.z )
+	local copy = CreateMaterial( "PocketMap_BakedPropLight_v2_" .. util.CRC( material:GetName() ), "UnlitGeneric", values )
+	if copy:IsError() then return end
+	copy:SetTexture( "$basetexture", texture )
+	litMaterials[material] = copy
+	return copy
+end
+
+local function packedColors( lighting, order )
+	if #order ~= #lighting.groups then return end
+	local colors = {}
+	for i, group in ipairs( order ) do
+		local first, count = unpack( lighting.groups[i] )
+		if #group ~= count then return end
+		for j, key in ipairs( group ) do
+			local offset = first + ( j - 1 ) * 4
+			local b, g, r = lighting.data:byte( offset, offset + 2 )
+			colors[key] = { math.min( r * 2, 255 ), math.min( g * 2, 255 ), math.min( b * 2, 255 ) }
+		end
+	end
+	return colors
+end
+
+function PropMesh.BuildWithVertexLighting( path, skin, lighting, order, budget, pause )
+	if not order or not lighting.data then return end
+	local colors = packedColors( lighting, order )
+	if not colors then return end
+	local data = util.GetModelMeshes( path, 0, 0, skin )
+	if not data or #data == 0 then return end
+	local pending, vertices = {}, 0
+	for _, part in ipairs( data ) do
+		if not part.material or not part.triangles or not part.verticies then return end
+		vertices = vertices + #part.triangles
+		if vertices > budget or #part.triangles < 3 then return end
+		local material = vertexLightMaterial( Material( part.material ) )
+		if not material then return end
+		local byVertex = {}
+		for _, vertex in ipairs( part.verticies ) do
+			local color = colors[NikNaks.ModelVertexKey( vertex.pos, vertex.normal )]
+			if not color then return end
+			byVertex[vertex] = color
+		end
+		for _, vertex in ipairs( part.triangles ) do if not byVertex[vertex] then return end end
+		pending[#pending + 1] = { material = material, triangles = part.triangles, colors = byVertex }
+		if pause then pause() end
+	end
+
+	local parts = {}
+	for _, part in ipairs( pending ) do addPart( parts, part.material, part.triangles, part.colors ) end
+	return parts, vertices
 end
 
 function PropMesh.Destroy( parts )

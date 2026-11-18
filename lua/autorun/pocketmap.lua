@@ -4,8 +4,9 @@ if not file.Exists("includes/modules/niknaks.lua","LUA") then
 end
 require("niknaks")
 
-if NikNaks.Version < 0.99 then
-	ErrorNoHalt( "[PocketMap] This addon needs NikNaks 0.99 or newer.\n" )
+local leaf = NikNaks.__metatables and NikNaks.__metatables["BSP Leaf"]
+if not NikNaks.EntityValue or not NikNaks.ParseEntityOutput or not leaf or not leaf.CalculateAmbientCubeLinear then
+	ErrorNoHalt( "[PocketMap] Update NikNaks to the companion BSP and lighting changes.\n" )
 	return
 end
 

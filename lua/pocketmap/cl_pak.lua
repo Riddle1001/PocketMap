@@ -155,7 +155,8 @@ local function isNewSafeAssetPath( name )
 	return false
 end
 
-function Pak.Read(zip, yield)
+function Pak.Read(zip, yield, selectEntry)
+	selectEntry = selectEntry or isNewSafeAssetPath
 	local entries = {}
 	if #zip == 0 then return entries end
 	local ending
@@ -166,6 +167,7 @@ function Pak.Read(zip, yield)
 	assert(uint(zip, ending + 4, 2) == 0 and uint(zip, ending + 6, 2) == 0, "Multi-disk ZIP is unsupported")
 	local count, pos = uint(zip, ending + 10, 2), uint(zip, ending + 16, 4) + 1
 	local totalBytes = 0
+	local cubemaps = {}
 	for _ = 1, count do
 		assert(zip:sub(pos, pos + 3) == "PK\1\2", "Invalid BSP ZIP entry")
 		local flags, method = uint(zip, pos + 8, 2), uint(zip, pos + 10, 2)
@@ -173,7 +175,9 @@ function Pak.Read(zip, yield)
 		local nameLength, extra, comment = uint(zip, pos + 28, 2), uint(zip, pos + 30, 2), uint(zip, pos + 32, 2)
 		local offset = uint(zip, pos + 42, 4) + 1
 		local name = zip:sub(pos + 46, pos + 45 + nameLength):lower():gsub("\\", "/")
-		if isNewSafeAssetPath( name ) then
+		local cubemap = name:match( "^materials/(maps/[%w_%-]+/cubemapdefault)%.vtf$" )
+		if cubemap then cubemaps[#cubemaps + 1] = cubemap end
+		if selectEntry( name ) then
 			assert( flags % 2 == 0, "Encrypted BSP asset" )
 			assert( size <= MAX_ENTRY_BYTES, "BSP asset is too large" )
 			totalBytes = totalBytes + size
@@ -198,15 +202,75 @@ function Pak.Read(zip, yield)
 		pos = pos + 46 + nameLength + extra + comment
 		if yield then yield() end
 	end
-	return entries
+	return entries, cubemaps
+end
+
+local vertexLightLinear = {}
+for byte = 0, 255 do vertexLightLinear[byte] = ( 2 * byte / 255 ) ^ 2.2 end
+
+-- VHV stores one packed BGRA light value per strip-group vertex. Average
+-- the finest LOD in linear space so repeated models can share one GPU mesh.
+local function readVertexLight( data )
+	if #data < 40 or uint( data, 1, 4 ) ~= 2 or uint( data, 9, 4 ) ~= 4 or uint( data, 13, 4 ) ~= 4 then return end
+	local checksum, meshes = uint( data, 5, 4 ), uint( data, 21, 4 )
+	local headerEnd = 40 + meshes * 28
+	if meshes == 0 or headerEnd > #data then return end
+
+	local finest, total, ranges = math.huge, 0, {}
+	for pos = 41, headerEnd, 28 do
+		local lod, count, offset = uint( data, pos, 4 ), uint( data, pos + 4, 4 ), uint( data, pos + 8, 4 )
+		if count > 0 and lod <= finest then
+			if offset < headerEnd or offset + count * 4 > #data then return end
+			if lod < finest then finest, total, ranges = lod, 0, {} end
+			total = total + count
+			ranges[#ranges + 1] = { offset + 1, count }
+		end
+	end
+	local r, g, b, samples = 0, 0, 0, 0
+	local step = math.max( 1, math.floor( total / 512 ) )
+	local first = 0
+	for _, range in ipairs( ranges ) do
+		for i = first, range[2] - 1, step do
+			local blue, green, red = data:byte( range[1] + i * 4, range[1] + i * 4 + 2 )
+			r, g, b = r + vertexLightLinear[red], g + vertexLightLinear[green], b + vertexLightLinear[blue]
+			samples = samples + 1
+		end
+		first = ( first - range[2] ) % step
+	end
+	if samples > 0 then
+		return { checksum = checksum, color = { r / samples, g / samples, b / samples },
+			data = finest == 0 and data or nil, groups = finest == 0 and ranges or nil }
+	end
+end
+
+function Pak.StaticPropLights( bsp, hdr, props, yield )
+	local pattern = hdr and "^sp_hdr_(%d+)%.vhv$" or "^sp_(%d+)%.vhv$"
+	local entries = Pak.Read( bsp:GetLumpString( 40 ), yield, function( name )
+		local index = tonumber( name:match( pattern ) )
+		return index ~= nil and props[index] ~= nil
+	end )
+	local lights = {}
+	for _, entry in ipairs( entries ) do
+		lights[tonumber( entry.name:match( pattern ) )] = readVertexLight( entry.data )
+		if yield then yield() end
+	end
+	return lights
 end
 
 function Pak.Mount(bsp, yield)
 	local zip = bsp:GetLumpString(40)
 	if #zip == 0 then return 0 end
 	local key = util.CRC(zip) .. "_" .. #zip
-	if mounted[key] then return mounted[key] end
-	local entries = Pak.Read(zip, yield)
+	if mounted[key] then return mounted[key].count, mounted[key].cubemap end
+	local entries, cubemaps = Pak.Read(zip, yield)
+	-- A renamed BSP can retain the original map namespace in its pakfile.
+	local cubemap = #cubemaps == 1 and cubemaps[1] or nil
+	if #cubemaps > 1 then
+		local expected = "maps/" .. bsp:GetMapName():lower() .. "/cubemapdefault"
+		for _, name in ipairs( cubemaps ) do
+			if name == expected then cubemap = name break end
+		end
+	end
 	-- GMA's whitelist rejects maps/*_particles.txt and rejects the whole
 	-- archive with it. Keep those manifests for our loader without mounting them.
 	local assets = {}
@@ -218,7 +282,10 @@ function Pak.Mount(bsp, yield)
 		end
 	end
 	entries = assets
-	if #entries == 0 then return 0 end
+	if #entries == 0 then
+		mounted[key] = { count = 0, cubemap = cubemap }
+		return 0, cubemap
+	end
 	local header = { "GMAD", string.char( 3 ), string.rep( "\0", 16 ), "\0PocketMap packed assets\0{}\0PocketMap\0", le32( 1 ) }
 	for i, entry in ipairs(entries) do
 		header[#header + 1] = le32(i) .. entry.name .. "\0" .. le32(#entry.data) .. le32(0) .. le32(entry.crc)
@@ -231,6 +298,6 @@ function Pak.Mount(bsp, yield)
 	local path = "pocketmap/pak/" .. key .. "_v" .. ASSET_FORMAT_VERSION .. ".gma.dat"
 	file.Write(path, data)
 	assert( game.MountGMA( "data/" .. path ), "Could not mount the BSP's packed assets" )
-	mounted[key] = #entries
-	return #entries
+	mounted[key] = { count = #entries, cubemap = cubemap }
+	return #entries, cubemap
 end
