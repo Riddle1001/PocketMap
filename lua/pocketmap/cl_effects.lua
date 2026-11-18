@@ -471,7 +471,7 @@ local function renderEffects( mini, setup )
 	cam.Start3D( eye, angles, camera.fov, camera.x, camera.y, camera.width, camera.height, camera.znear / mini.scale, camera.zfar / mini.scale )
 	cam.PushModelMatrix( Matrix() )
 	render.OverrideDepthEnable( true, false )
-	local ok, err = pcall( function()
+	local function drawVisible()
 		for _, effect in ipairs( visible ) do
 			if effect.kind == "sprite" then
 				local visibility = effect.pixelVisibility
@@ -499,7 +499,14 @@ local function renderEffects( mini, setup )
 			elseif effect.kind == "smoke" then drawSmoke( effect )
 			else drawParticle( mini, effect, effect.renderActive, setup ) end
 		end
-	end )
+	end
+	local fog = PocketMap.Fog
+	local ok, err
+	if fog then
+		ok, err = pcall( fog.DrawWorld, mini, 1, setup.angles, drawVisible )
+	else
+		ok, err = pcall( drawVisible )
+	end
 	cam.IgnoreZ( false )
 	cam.PopModelMatrix()
 	cam.End3D()

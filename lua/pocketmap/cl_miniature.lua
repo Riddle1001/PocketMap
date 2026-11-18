@@ -165,6 +165,7 @@ function Mini:Destroy()
 	self.objects, self.skyObjects, self.detailMeshes, self.propGroups, self.bsp = {}, {}, {}, {}, nil
 	self.atlasTarget, self.atlasLayerTarget, self.atlasObject, self.lightmapTexture = nil, nil, nil, nil
 	self.displacementCollision = nil
+	self.ropeBatches = nil
 
 	PocketMap.Hooks.SetActive( next( active ) ~= nil )
 end

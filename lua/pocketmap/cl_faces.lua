@@ -20,7 +20,6 @@ local HIDDEN_BRUSH_CLASSES = {
 	func_dustcloud = true, func_proprespawnzone = true, func_nogrenades = true, func_buyzone = true,
 	func_bomb_target = true, func_hostage_rescue = true, func_no_defuse = true, func_nav_avoid = true,
 	func_nav_prefer = true, func_nav_prerequisite = true, func_fish_pool = true,
-	func_illusionary = true,
 }
 
 ---An instruction to the compiler (clip, trigger, invisible, fog ...), not something to look at. The sky and the black one are drawn in game.
@@ -71,6 +70,7 @@ end
 local function isInvisible( entity )
 	local renderMode = tonumber( entity.rendermode ) or 0
 	return renderMode == RENDERMODE_DONT_RENDER or ( tonumber( entity.renderamt ) == 0 and renderMode ~= 0 )
+		or bit.band( tonumber( entity.effects ) or 0, 0x20 ) ~= 0 -- EF_NODRAW
 end
 
 ---Triggers, hidden brushes and brushes that start disabled are left out.
@@ -177,11 +177,26 @@ local function isInSkyRoom( bsp, skyRoom, face )
 	return face:IsDisplacement() and displacementTouchesSkyRoom( bsp, face, skyRoom.area )
 end
 
+local function brushInSkyRoom( bsp, skyRoom, face, models )
+	if not skyRoom then return false end
+	local model = face:GetBModel()
+	local inSky = models[model]
+	if inSky == nil then
+		local entity = face:GetEntity()
+		local origin = entity and PocketMap.MapIO.Vector( entity.origin )
+		local leaf = origin and bsp:PointInLeaf( 0, origin )
+		inSky = leaf ~= nil and leaf.area == skyRoom.area
+		models[model] = inSky
+	end
+	return inSky
+end
+
 ---@return table[] world # faces of the map and of brush entities
 ---@return table[] sky # faces of the 3D skybox room, drawn around the map
 local function splitDrawable( mini, bsp, skyRoom )
 	local windowBrushes = areaportalWindowBrushes( bsp )
 	local world, sky, seen = {}, {}, 0
+	local skyBrushModels = {}
 	mini.mapIO.dynamicFaces = {}
 
 	for _, face in pairs( bsp:GetFaces() ) do
@@ -198,7 +213,8 @@ local function splitDrawable( mini, bsp, skyRoom )
 				elseif face:IsWorld() then
 					world[#world + 1] = face
 				elseif brushEntityShown( face, windowBrushes ) then
-					world[#world + 1] = face
+					local list = brushInSkyRoom( bsp, skyRoom, face, skyBrushModels ) and sky or world
+					list[#list + 1] = face
 					mini.brushFaces = mini.brushFaces + 1
 				end
 			end
@@ -213,11 +229,24 @@ end
 
 ---@return table<string, table[]> groups # texture name -> faces
 ---@return string[] order # the texture names, the biggest group first so the shape shows up early
-local function groupByMaterial( faces )
+local function groupByMaterial( faces, brushMaterials, appearances )
 	local groups, order = {}, {}
 
 	for _, face in ipairs( faces ) do
 		local key = face:GetTexture() or "?"
+		if not face:IsWorld() then
+			local entity = face:GetEntity()
+			local appearance = appearances[entity]
+			if appearance == nil then
+				appearance = PocketMap.Materials.BrushAppearance( entity ) or false
+				appearances[entity] = appearance
+			end
+			if appearance then
+				local name = key
+				key = name .. "\0" .. appearance.key
+				if not brushMaterials[key] then brushMaterials[key] = { name = name, appearance = appearance } end
+			end
+		end
 		if not groups[key] then
 			groups[key] = {}
 			order[#order + 1] = key
@@ -257,8 +286,10 @@ function Faces.Sort( mini, job )
 	local world, sky = splitDrawable( mini, job.bsp, skyRoom )
 	world = withoutDuplicatePolygons( mini, world )
 
-	job.groups, job.order = groupByMaterial( world )
-	job.skyGroups, job.skyOrder = groupByMaterial( sky )
+	job.brushMaterials = {}
+	local appearances = {}
+	job.groups, job.order = groupByMaterial( world, job.brushMaterials, appearances )
+	job.skyGroups, job.skyOrder = groupByMaterial( sky, job.brushMaterials, appearances )
 	mini.skyFaceCount = #sky
 
 	job.slicesTotal = math.max( countSlices( job.groups, job.order ) + countSlices( job.skyGroups, job.skyOrder ), 1 )

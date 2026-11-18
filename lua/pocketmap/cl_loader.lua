@@ -105,7 +105,9 @@ local function readEntities( mini, job )
 	PocketMap.MapIO.Build( mini, job.entities )
 	PocketMap.Effects.Build( mini, job.entities )
 
+	if PocketMap.Fog then PocketMap.Fog.Read( mini ) end
 	PocketMap.Sky.Read( mini, job.entities )
+	PocketMap.Ropes.Build( mini, job )
 end
 
 ---Mostly the engine reading files, and a fast one costs next to nothing, so as many as possible are loaded in one frame:
@@ -115,9 +117,15 @@ local function loadMaterials( mini, job )
 	job.materials = {}
 
 	for i, key in ipairs( order ) do
-		mini:SetStatus( "Material " .. key, 0.05 + 0.1 * ( i - 1 ) / #order )
+		local brush = job.brushMaterials[key]
+		local name = brush and brush.name or key
+		mini:SetStatus( "Material " .. name, 0.05 + 0.1 * ( i - 1 ) / #order )
 
-		local material, seconds = PocketMap.Materials.Load( key )
+		local material, seconds = PocketMap.Materials.Load( name )
+		local refractive
+		material, refractive = PocketMap.Materials.ForPocketGlass( material, mini.packedCubemap )
+		if brush then material = PocketMap.Materials.ForBrush( material, brush.appearance ) end
+		if refractive then mini.hasRefractiveWorld = true end
 		job.materials[key] = material
 		-- Prepare the optional shader snapshots during the cooperative rebuild,
 		-- rather than compiling every newly visible material in a draw callback.
@@ -309,8 +317,8 @@ local function buildMaterialGroups( mini, job, groups, order, out, isWorld, prog
 		local list = groups[key]
 		local material = job.materials[key]
 
-		-- Flat water surfaces get the effects of cl_water.lua, which need the atlas
-		if isWorld and mini.lightmapTexture and Water.IsWaterMaterial( material ) then
+		-- Water owns its receiver geometry even if the map has no lightmap atlas.
+		if isWorld and Water.IsWaterMaterial( material ) then
 			list = Water.Build( mini, key, material, list )
 		end
 
@@ -340,7 +348,8 @@ local function buildMaterialGroups( mini, job, groups, order, out, isWorld, prog
 				mini.worldFaceGroups[#mini.worldFaceGroups + 1] = { material = material, faces = batch }
 			end
 			for first = 1, #batch, facesPerMesh do
-				mini:SetStatus( "Building " .. key, 0.15 + 0.45 * math.min( 1, progress.done / job.slicesTotal ) )
+				local source = job.brushMaterials[key]
+				mini:SetStatus( "Building " .. ( source and source.name or key ), 0.15 + 0.45 * math.min( 1, progress.done / job.slicesTotal ) )
 				local last = math.min( first + facesPerMesh - 1, #batch )
 				local object, mins, maxs = buildSlice( batch, first, last, job.addOptions, isWorld and mini or nil )
 				out[#out + 1] = object
@@ -400,9 +409,9 @@ end
 local function mountPackedAssetsIfPossible( mini, job )
 	mini:SetStatus( "Mounting packed assets", 0.01 )
 
-	local ok, result = pcall( PocketMap.Pak.Mount, job.bsp, coroutine.yield )
+	local ok, result, cubemap = pcall( PocketMap.Pak.Mount, job.bsp, coroutine.yield )
 	if ok then
-		mini.packedAssets = result
+		mini.packedAssets, mini.packedCubemap = result, cubemap
 	else
 		print( "[PocketMap] " .. mini.mapName .. ": the packed assets were not mounted (" .. tostring( result ) .. ")" )
 	end

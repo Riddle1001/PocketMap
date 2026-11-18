@@ -27,7 +27,8 @@ function Visibility.View( mini, pad, allowWater )
 	local previous = cache[pad]
 	if previous and previous.frame == FrameNumber() and previous.stamp == stamp
 		and previous.worldOrigin == view.origin and previous.worldAngles == view.angles
-		and previous.fov == fov and previous.width == width and previous.height == height and previous.aspect == view.aspect
+		and previous.fov == fov and previous.width == width and previous.height == height
+		and previous.aspect == view.aspect and previous.znear == view.znear
 		and ( not clip and not previous.clip or clip and previous.clip
 			and clip.normal == previous.clip.normal and clip.distance == previous.clip.distance ) then return previous end
 	local aspect = width / height
@@ -46,7 +47,7 @@ function Visibility.View( mini, pad, allowWater )
 		mapOrigin = ( origin - mini.boxCenter ) / mini.scale + mini.mapCenter,
 		worldOrigin = Vector( view.origin.x, view.origin.y, view.origin.z ),
 		worldAngles = Angle( view.angles.p, view.angles.y, view.angles.r ),
-		fov = fov, width = width, height = height, aspect = view.aspect,
+		fov = fov, width = width, height = height, aspect = view.aspect, znear = view.znear,
 		forward = forward, right = right, up = up, normals = normals,
 		halfWidth = halfWidth, halfHeight = halfHeight,
 		widthRadius = math.sqrt( 1 + halfWidth * halfWidth ), heightRadius = math.sqrt( 1 + halfHeight * halfHeight ),
@@ -100,22 +101,25 @@ local opaqueFaces = setmetatable( {}, { __mode = "k" } )
 local OPAQUE_SHADERS = { LightmappedGeneric = true, WorldVertexTransition = true }
 local UNSAFE_MATERIAL_FLAGS = 0x200180 -- translucent, alpha test, additive
 
-local function opaqueFace( face )
+local function opaqueFace( face, material )
+	if not face:IsWorld() or face:IsDisplacement() or not face:ShouldRender() then return false end
+	material = material or face:GetMaterial()
+	local shader = ( material:GetShader() or "" ):gsub( "_DX%d+$", "" )
+	if not OPAQUE_SHADERS[shader] or material:IsError()
+		or bit.band( material:GetInt( "$flags" ) or 0, UNSAFE_MATERIAL_FLAGS ) ~= 0
+		or ( material:GetFloat( "$alpha" ) or 1 ) < 1 then return false end
+	for _, key in ipairs( { "$translucent", "$alphatest", "$additive", "$vertexalpha", "$nodraw", "$wireframe" } ) do
+		if ( material:GetInt( key ) or 0 ) ~= 0 then return false end
+	end
+	local keys = material:GetKeyValues()
+	return not keys.Proxies and not keys.proxies
+end
+
+function Visibility.OpaqueWorldFace( face, material )
+	if material then return opaqueFace( face, material ) end
 	local known = opaqueFaces[face]
 	if known ~= nil then return known end
-	local safe = face:IsWorld() and not face:IsDisplacement() and face:ShouldRender()
-	if safe then
-		local material = face:GetMaterial()
-		local shader = ( material:GetShader() or "" ):gsub( "_DX%d+$", "" )
-		safe = OPAQUE_SHADERS[shader] == true and not material:IsError()
-			and bit.band( material:GetInt( "$flags" ) or 0, UNSAFE_MATERIAL_FLAGS ) == 0
-			and ( material:GetFloat( "$alpha" ) or 1 ) >= 1
-		for _, key in ipairs( { "$translucent", "$alphatest", "$additive", "$vertexalpha", "$nodraw", "$wireframe" } ) do
-			if ( material:GetInt( key ) or 0 ) ~= 0 then safe = false break end
-		end
-		local keys = material:GetKeyValues()
-		if keys.Proxies or keys.proxies then safe = false end
-	end
+	local safe = opaqueFace( face )
 	opaqueFaces[face] = safe
 	return safe
 end
@@ -125,7 +129,7 @@ end
 function Visibility.Occluded( bsp, eye, center, corners )
 	local trace = bsp:SurfaceTraceLine( eye, center )
 	local face = trace and trace.Face
-	if not trace or not trace.Hit or trace.HitSky or not face or not opaqueFace( face ) then return false end
+	if not trace or not trace.Hit or trace.HitSky or not face or not Visibility.OpaqueWorldFace( face ) then return false end
 	for _, corner in ipairs( corners ) do
 		local hit = face:LineSegmentIntersection( eye, corner )
 		if not hit or eye:DistToSqr( hit ) >= eye:DistToSqr( corner ) * 0.9025 then return false end

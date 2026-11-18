@@ -4,6 +4,29 @@ PocketMap.Scene = {}
 local Scene = PocketMap.Scene
 local cvScene = CreateClientConVar( "pocketmap_walk_scene", "1", true, false,
 	"Render a walking pocket directly, without first rendering the host world" )
+local cvColorCorrection = GetConVar( "mat_colorcorrection" )
+local coveredSkyView
+local hostHasColorCorrection
+
+local function needsNativeColorCorrection( mini )
+	if not cvColorCorrection or not cvColorCorrection:GetBool() then return false end
+	if hostHasColorCorrection ~= nil then return hostHasColorCorrection end
+
+	local bsp = mini.mapName == game.GetMap() and mini.bsp or NikNaks.Map()
+	if not bsp then return false end
+	hostHasColorCorrection = false
+	for _, entity in pairs( bsp:GetEntities() ) do
+		local class = PocketMap.Entities.Class( entity )
+		if class == "color_correction" or class == "color_correction_volume" then
+			local filename = NikNaks.EntityValue( entity, "filename" )
+			if type( filename ) == "string" and filename ~= "" then
+				hostHasColorCorrection = true
+				break
+			end
+		end
+	end
+	return hostHasColorCorrection
+end
 
 -- RenderScene runs before EyePos/EyeAngles describe the new frame. All our
 -- renderers use this scoped camera instead; nested water/RT views keep theirs.
@@ -19,6 +42,7 @@ local function drawScene( origin, angles, fov )
 	if PocketMap.Settings and walk then enabled = PocketMap.Settings.Compat( walk.mini, "direct_scene", cvScene ) end
 	if not enabled or Scene.current or not walk or walk.waitingForRespawn
 		or PocketMap.Water.pass or render.GetRenderTarget() or not render.RenderHUD then return end
+	coveredSkyView = nil
 	local mini = walk.mini
 	if mini.entityRefresh or mini == Scene.failedMini or mini.state ~= "ready" or not IsValid( mini.ent )
 		or mini.ent:IsOutsideBox( origin ) then return end
@@ -33,6 +57,9 @@ local function drawScene( origin, angles, fov )
 	local in3D, in2D, fallback = false, false, nil
 	local ok, err = xpcall( function()
 		fallback = mini.RequiresEngineView and mini:RequiresEngineView()
+		-- Native postprocessing applies the host's authored LUT after the
+		-- world is drawn. Keep it on both sides of a glow's frustum boundary.
+		if not fallback and needsNativeColorCorrection( mini ) then fallback = "color correction" end
 		if fallback then return end
 		render.SetStencilEnable( false )
 		render.Clear( 0, 0, 0, 255, true, true )
@@ -57,6 +84,12 @@ local function drawScene( origin, angles, fov )
 	if fallback and ok then
 		Scene.lastFallback = fallback
 		Scene.engineFrames = ( Scene.engineFrames or 0 ) + 1
+		-- Glow visibility needs the engine view. The pocket backdrop still
+		-- covers the host sky when the camera is inside the loaded block.
+		if ( fallback == "glow" or fallback == "color correction" )
+			and mini.skyBackdrop and mini.scaleVec and #mini.objects > 0 then
+			coveredSkyView = view
+		end
 		return
 	end
 	if in2D then cam.End2D() end
@@ -73,4 +106,20 @@ local function drawScene( origin, angles, fov )
 	return true
 end
 
+local function skipCoveredSky()
+	local view = coveredSkyView
+	if not view or view.frame ~= FrameNumber() or PocketMap.Water.pass or render.GetRenderTarget() then return end
+	local walk = PocketMap.Walk and PocketMap.Walk.session
+	local mini = view.mini
+	if not walk or walk.mini ~= mini or walk.waitingForRespawn or mini.state ~= "ready" or mini.entityRefresh
+		or not mini.skyBackdrop then return end
+	local setup = render.GetViewSetup()
+	if not setup or setup.ortho or setup.offcenter or setup.subrect or setup.origin ~= view.origin or setup.angles ~= view.angles
+		or setup.width ~= view.width or setup.height ~= view.height or ( setup.x or 0 ) ~= 0 or ( setup.y or 0 ) ~= 0
+		or setup.fov ~= view.fov then return end
+	coveredSkyView = nil
+	return true
+end
+
 PocketMap.Hooks.Register( "RenderScene", "PocketMap_WalkScene", drawScene )
+PocketMap.Hooks.Register( "PreDrawSkyBox", "PocketMap_CoveredHostSky", skipCoveredSky )

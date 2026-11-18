@@ -5,6 +5,9 @@ PocketMap.Decals = {}
 local Decals, IO = PocketMap.Decals, PocketMap.MapIO
 local AXES = { Vector( 1, 0, 0 ), Vector( 0, 1, 0 ), Vector( 0, 0, 1 ) }
 local MAX_VERTS = 30000
+-- Four steps of a 24-bit depth buffer keep the overlay ahead of its
+-- receiver despite rounding between separately projected meshes.
+local DECAL_DEPTH_MAX = 1 - 2 ^ -22
 
 local function interpolate( a, b, t )
 	local v = { pos = a.pos + ( b.pos - a.pos ) * t, normal = a.normal }
@@ -54,10 +57,11 @@ local function projectFace( group, face, project, clips, lightUV, mini )
 					group.batches[#group.batches + 1] = batch
 				end
 			end
-			local us, vs
-			if lightUV then us, vs = lightUV( face, polygon ) end
+			local us, vs, du, dv
+			if lightUV then us, vs, du, dv = lightUV( face, polygon ) end
 			for i, v in ipairs( polygon ) do
 				v.lu, v.lv = us and us[i] or 0, vs and vs[i] or 0
+				v.du, v.dv = du and du[i] or 0, dv and dv[i] or 0
 			end
 			for i = 2, #polygon - 1 do
 				for _, v in ipairs( { polygon[1], polygon[i], polygon[i + 1] } ) do batch.verts[#batch.verts + 1] = v end
@@ -199,6 +203,7 @@ function Decals.Build( mini, job )
 					mesh.Position( v.pos + v.normal * 0.05 )
 					mesh.Normal( v.normal )
 					mesh.TexCoord( 0, v.u, v.v ) mesh.TexCoord( 1, v.lu, v.lv )
+					mesh.TexCoord( 2, v.du, v.dv )
 					mesh.Color( 255, 255, 255, 255 ) mesh.AdvanceVertex()
 				end
 				mesh.End()
@@ -225,22 +230,29 @@ local function visibleMeshes( group, pvs )
 	return group.visibleMeshes
 end
 
+local function drawGroups( mini, sky, pvs, state )
+	for _, group in ipairs( mini.decals ) do
+		local record = group.entity and mini.mapIO.byEntity[group.entity]
+		local current = state and record and state.records[record]
+		if group.sky == sky and ( not group.entity or current and current.decalActive ) then
+			render.SetMaterial( group.material )
+			for _, m in ipairs( visibleMeshes( group, pvs ) ) do m:Draw() end
+		end
+	end
+end
+
 function Decals.Draw( mini, skyMatrix, pvs )
-	if not mini.decals or not mini.lightmapTexture then return end
+	if not mini.decals or #mini.decals == 0 or not mini.lightmapTexture then return end
 	if skyMatrix and PocketMap.Settings and not PocketMap.Settings.Enabled( mini, "sky_decals" ) then return end
 	local walk = PocketMap.Walk and PocketMap.Walk.session
 	local state = walk and walk.mini == mini and walk.io
 	cam.PushModelMatrix( skyMatrix or mini.matrix )
 	render.SetLightmapTexture( mini.lightmapTexture )
 	render.OverrideDepthEnable( true, false )
-	for _, group in ipairs( mini.decals ) do
-		local record = group.entity and mini.mapIO.byEntity[group.entity]
-		local current = state and record and state.records[record]
-		if group.sky == ( skyMatrix ~= nil ) and ( not group.entity or current and current.decalActive ) then
-			render.SetMaterial( group.material )
-			for _, m in ipairs( visibleMeshes( group, not skyMatrix and pvs ) ) do m:Draw() end
-		end
-	end
+	render.DepthRange( 0, DECAL_DEPTH_MAX )
+	local ok, err = pcall( drawGroups, mini, skyMatrix ~= nil, not skyMatrix and pvs, state )
+	render.DepthRange( 0, 1 )
 	render.OverrideDepthEnable( true, true )
 	cam.PopModelMatrix()
+	if not ok then error( err, 0 ) end
 end
